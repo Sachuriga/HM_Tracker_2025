@@ -20,8 +20,20 @@ fi
 
 # ================= FUNCTIONS =================
 get_cpu_usage() {
-    # LC_ALL=C ensures 'top' output is in standard English with dot decimals
-    LC_ALL=C top -bn2 -d 0.5 | grep "Cpu(s)" | tail -n 1 | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}' | awk '{printf "%.0f", $1}'
+    # Method 1: Try using vmstat (Most reliable, low overhead)
+    if command -v vmstat &> /dev/null; then
+        # Run vmstat for 1 second, 2 times. Tail gets the last line.
+        # Column 15 is usually 'id' (idle). We calculate 100 - idle.
+        local idle=$(LC_ALL=C vmstat 1 2 | tail -n 1 | awk '{print $15}')
+        echo "$idle" | awk '{print 100 - $1}'
+        
+    # Method 2: Fallback to TOP if vmstat is missing
+    else
+        # grep the line with "id", extract the number before "id"
+        LC_ALL=C top -bn2 -d 0.5 | grep "Cpu(s)" | tail -n 1 | \
+        sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | \
+        awk '{print 100 - $1}' | awk '{printf "%.0f", $1}'
+    fi
 }
 
 get_gpu_usage() {
@@ -31,6 +43,19 @@ get_gpu_usage() {
         echo "0"
     fi
 }
+
+# --- NEW: CONSTANT MONITOR FUNCTION ---
+monitor_resources() {
+    while true; do
+        sleep 30
+        local cpu=$(get_cpu_usage)
+        local gpu=$(get_gpu_usage)
+        local timestamp=$(date '+%H:%M:%S')
+        
+        # Print to stderr to ensure it shows up even if stdout is redirected
+        echo "   [WATCHDOG $timestamp] CPU: ${cpu}% | GPU: ${gpu}%" >&2
+    done
+}
 # =============================================
 
 # =================THE PIPELINE WORKER=================
@@ -39,37 +64,30 @@ run_pipeline() {
     local OP="$2"
     local LOG_FILE="$OP/pipeline_log.txt"
     
-    # Create the output directory if it doesn't exist so we can write the log
     mkdir -p "$OP"
     
     echo ">>> STARTING JOB: Pair $IP -> $OP"
     echo "================= STARTING PIPELINE $(date) =================" > "$LOG_FILE"
 
-    # === Extract DIO using Trodes ===
+    # === Extract DIO ===
     for i in $(find "$IP" -name "*.rec" -type f); do
         echo "   [Trodes] Processing: $i"
         echo "--- RUNNING TRODES: $i ---" >> "$LOG_FILE"
-        
-        # Using tee to show output on screen AND save to file
         ./Trodes_2-3-2_Ubuntu2004/trodesexport -dio -rec "$i" 2>&1 | tee -a "$LOG_FILE"
     done
 
     # === Run Sync Script ===
     echo "   [Sync] Running Video_LED_Sync..."
     echo "--- RUNNING LED SYNC ---" >> "$LOG_FILE"
-    
-    # -u ensures python output is not buffered (crucial for progress bars)
     python3 -u ./src/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" -f "$FREQ" 2>&1 | tee -a "$LOG_FILE"
     
-    # Capture the exit status of the FIRST command in the pipe (python), not tee
     if [ ${PIPESTATUS[0]} -ne 0 ]; then
         echo "!!! ERROR in LED SYNC for $IP !!!"
         echo "    Check log: $LOG_FILE"
-        return # Stop this specific pipeline
+        return 
     fi
 
-    # === (Optional) Stitch step ===
-    # Using -u + tee
+    # === Stitch step ===
     python3 -u ./src/join_views.py "$IP" 2>&1 | tee -a "$LOG_FILE"
 
     # ==== Tracking ====
@@ -94,26 +112,20 @@ run_pipeline() {
     # ==== Plotting ====
     echo "   [Plotting] Running plot_trials..."
     echo "--- RUNNING PLOTTING ---" >> "$LOG_FILE"
-    
     python3 -u plot_trials.py -o "$OP" 2>&1 | tee -a "$LOG_FILE"
     
     if [ ${PIPESTATUS[0]} -ne 0 ]; then
         echo "!!! ERROR in PLOTTING for $IP !!!"
-        echo "    Check log: $LOG_FILE"
         return
     fi
 
     # ==== Compression ====
     VIDEO_FILE=$(ls "$OP"/*.mp4 2>/dev/null | head -n 1)
-
     if [[ -n "$VIDEO_FILE" ]]; then
         echo "   [Compress] Compressing $VIDEO_FILE..."
         echo "--- RUNNING COMPRESSION ---" >> "$LOG_FILE"
         TEMP_FILE="$OP/__temp_compressed.mp4"
-        
-        # FFmpeg output is stderr usually, 2>&1 captures it.
         ffmpeg -y -hide_banner -loglevel warning -i "$VIDEO_FILE" -vcodec h264_nvenc -qp 30 "$TEMP_FILE" 2>&1 | tee -a "$LOG_FILE"
-
         if [[ -f "$TEMP_FILE" ]]; then
             mv -f "$TEMP_FILE" "$VIDEO_FILE"
         fi
@@ -127,6 +139,13 @@ run_pipeline() {
 
 echo "Scanning $ROOT_DIR for ip/op pairs..."
 
+# --- START BACKGROUND MONITOR ---
+echo "Starting background resource monitor (Updates every 30s)..."
+monitor_resources &       # Run in background
+MONITOR_PID=$!            # Save the Process ID
+trap "kill $MONITOR_PID" EXIT # Kill it when script ends or crashes
+# --------------------------------
+
 # Find directory pairs
 find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH; do
     
@@ -138,24 +157,15 @@ find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH;
         echo "--------------------------------------------------------"
         echo "Found Next Candidate: $DIR_NAME -> op$NUM"
         
-        # === RESOURCE CHECK LOOP ===
+        # === PRE-LAUNCH RESOURCE CHECK LOOP ===
+        # This loop ensures we don't start if system is ALREADY overloaded
         while true; do
             CURRENT_CPU=$(get_cpu_usage)
             CURRENT_GPU=$(get_gpu_usage)
-            
-            # Count running background jobs
             JOBS_RUNNING=$(jobs -r | wc -l)
 
-            echo "   [SYSTEM STATUS]"
-            echo "   Resources: CPU: $CURRENT_CPU% | GPU: $CURRENT_GPU% (Limit: $MAX_CPU_LOAD%)"
-            echo "   Active Jobs: $JOBS_RUNNING"
+            echo "   [MAIN CHECK] Active Jobs: $JOBS_RUNNING | CPU: $CURRENT_CPU% | GPU: $CURRENT_GPU%"
             
-            if [[ "$JOBS_RUNNING" -gt 0 ]]; then
-                echo "   Currently Running Programs:"
-                jobs -r | sed 's/.*run_pipeline//' | tr -d '&' | awk '{print "     >> IP: " $1 " | OP: " $2}'
-            fi
-            echo "   ---------------------------"
-
             if (( CURRENT_CPU < MAX_CPU_LOAD )) && (( CURRENT_GPU < MAX_GPU_LOAD )); then
                 break
             else
@@ -169,9 +179,7 @@ find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH;
             fi
         done
 
-        # === LAUNCH JOB IN BACKGROUND ===
-        # NOTE: Because we are using tee now, if multiple jobs run at once,
-        # their output will mix together on the screen.
+        # === LAUNCH JOB ===
         run_pipeline "$IP_PATH" "$OP_PATH" &
         
         sleep "$RAMP_UP_DELAY"
