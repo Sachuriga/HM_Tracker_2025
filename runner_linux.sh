@@ -4,7 +4,7 @@
 ROOT_DIR="$1"
 MAX_CPU_LOAD=80
 MAX_GPU_LOAD=80
-FREQ=30000
+FREQ=20000
 
 ONNX_WEIGHTS_PATH="/home/genzel/Desktop/Documents/Param/Track_sachi/yolov3_training_best.onnx"
 
@@ -20,8 +20,10 @@ fi
 
 # Function to get current CPU usage
 get_cpu_usage() {
-    # Greps the idle cpu percentage and subtracts it from 100
-    top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}' | awk '{printf "%.0f", $1}'
+    # Run top twice (-n2), wait 0.5s (-d 0.5) between samples.
+    # Take the last line (tail -n 1) which represents the calculated usage of the 2nd run.
+    # Parse the idle percentage and subtract from 100.
+    top -bn2 -d 0.5 | grep "Cpu(s)" | tail -n 1 | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}' | awk '{printf "%.0f", $1}'
 }
 
 # Function to get current GPU usage (returns 0 if no nvidia-smi)
