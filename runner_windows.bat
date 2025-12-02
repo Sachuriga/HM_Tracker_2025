@@ -4,19 +4,16 @@ setlocal EnableDelayedExpansion
 :: ================= CONFIGURATION =================
 set "TRODES_BIN=C:\Users\gl_pc\Desktop\Track\trodes\trodesexport.exe"
 set "ONNX_WEIGHTS_PATH=C:\Users\gl_pc\Desktop\track\yolov3_training_best.onnx"
-
-set MAX_CPU_LOAD=95
-set MAX_GPU_LOAD=95
 set FREQ=30000
-set RAMP_UP_DELAY=10
 :: =================================================
 
+:: Check arguments
 if "%~1"=="" (
-    echo Usage: runner.bat "C:\Your\Data\Path"
+    echo Usage: runner_direct.bat "C:\Users\gl_pc\Desktop\Track_2021"
     exit /b 1
 )
 
-:: Clean path and remove trailing backslash if present
+:: Clean path
 set "ROOT_DIR=%~1"
 if "!ROOT_DIR:~-1!"=="\" set "ROOT_DIR=!ROOT_DIR:~0,-1!"
 
@@ -29,49 +26,26 @@ for /d %%D in ("%ROOT_DIR%\ip*") do (
     set "NUM=!DIR_NAME:ip=!"
     set "OP_PATH=!ROOT_DIR!\op!NUM!"
 
-    :: Method: Try to actually enter the directory to prove it exists
+    :: Check if OP folder exists using pushd (safest method)
     pushd "!OP_PATH!" 2>nul
     if not errorlevel 1 (
         popd
+        echo [MATCH] Found pair: !DIR_NAME! -^> op!NUM!
         
-        :: === FOLDER FOUND ===
-        :CHECK_RESOURCES
-        :: Reset variables to 0 to prevent syntax crashes
-        set CURRENT_CPU=0
-        set CURRENT_GPU=0
-        
-        call :GET_CPU_USAGE CURRENT_CPU
-        call :GET_GPU_USAGE CURRENT_GPU
-        
-        cls
-        echo ---------------------------------------------------
-        echo Processing: !DIR_NAME!
-        echo Path: !OP_PATH!
-        echo System Status: CPU !CURRENT_CPU!%% ^| GPU !CURRENT_GPU!%%
-        echo ---------------------------------------------------
-
-        :: Math Check (Safe against empty vars)
-        if !CURRENT_CPU! LSS %MAX_CPU_LOAD% (
-            if !CURRENT_GPU! LSS %MAX_GPU_LOAD% (
-                goto :LAUNCH_JOB
-            )
-        )
-        
-        timeout /t 5 /nobreak >nul
-        goto :CHECK_RESOURCES
-
-        :LAUNCH_JOB
-        echo Launching Job...
+        :: LAUNCH IMMEDIATELY (No CPU Check)
+        :: We use 'start' to open a new window.
         start "Job: !DIR_NAME!" cmd /c "%~f0" :WORKER "!IP_PATH!" "!OP_PATH!"
-        timeout /t %RAMP_UP_DELAY% /nobreak >nul
-
+        
+        :: Wait 5 seconds to prevent opening 50 windows at once
+        timeout /t 5 /nobreak >nul
+        
     ) else (
-        :: === FOLDER NOT FOUND ===
-        echo [Skipping] !DIR_NAME!: Could not find folder "!OP_PATH!"
+        echo [SKIP]  !DIR_NAME! (No matching '!OP_PATH!')
     )
 )
 
-echo All pairs queued.
+echo.
+echo All jobs triggered.
 pause
 exit /b 0
 
@@ -84,26 +58,38 @@ if "%1"==":WORKER" (
     
     if not exist "%~3" mkdir "%~3"
 
+    :: Redirect all output to log, but also keep window open
     (
-        echo ================= STARTING PIPELINE %DATE% %TIME% =================
-        echo Processing: %IP%
+        echo ================= STARTING PIPELINE =================
+        echo Time: %DATE% %TIME%
+        echo Input: %IP%
+        echo Output: %OP%
+        echo.
+        
+        :: 1. CHECK PYTHON (Important for Conda)
+        python --version
+        if errorlevel 1 (
+            echo !!! ERROR: Python not found. Anaconda environment might not be active in this window.
+            goto :ErrorExit
+        )
 
-        :: === Extract DIO ===
+        :: 2. RUN TRODES
+        echo --- RUNNING TRODES ---
         for /r "%IP%" %%f in (*.rec) do (
-            echo --- RUNNING TRODES: %%~nxf ---
+            echo Processing: %%~nxf
             "%TRODES_BIN%" -dio -rec "%%f"
         )
 
-        :: === Run Sync Script ===
+        :: 3. RUN SYNC
         echo --- RUNNING LED SYNC ---
         python -u ./src/Video_LED_Sync_using_ICA.py -i "%IP%" -o "%OP%" -f %FREQ%
         if errorlevel 1 goto :ErrorExit
 
-        :: === Stitch Step ===
+        :: 4. RUN STITCHING
         echo --- RUNNING STITCHING ---
         python -u ./src/join_views.py "%IP%"
 
-        :: === Tracking ===
+        :: 5. RUN TRACKER
         if exist "%IP%\stitched.mp4" (
             echo --- RUNNING YOLO TRACKER ---
             python -u ./src/TrackerYolov.py --input_folder "%IP%\stitched.mp4" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
@@ -112,14 +98,14 @@ if "%1"==":WORKER" (
             echo [Warning] stitched.mp4 not found. Skipping tracking.
         )
 
-        :: === Plotting ===
+        :: 6. PLOTTING
         echo --- RUNNING PLOTTING ---
         python -u plot_trials.py -o "%OP%"
         if errorlevel 1 goto :ErrorExit
 
-        :: === Compression ===
+        :: 7. COMPRESSION
         for %%v in ("%OP%\*.mp4") do (
-            echo --- RUNNING COMPRESSION on %%~nxv ---
+            echo --- RUNNING COMPRESSION: %%~nxv ---
             ffmpeg -y -hide_banner -loglevel warning -i "%%v" -vcodec libx264 -crf 28 "%OP%\__temp_compressed.mp4"
             if exist "%OP%\__temp_compressed.mp4" (
                 move /y "%OP%\__temp_compressed.mp4" "%%v"
@@ -128,36 +114,24 @@ if "%1"==":WORKER" (
         )
         :CompDone
 
-        echo ================= FINISHED %DATE% %TIME% =================
-        echo You may close this window now.
-        exit
+        echo.
+        echo ================= FINISHED =================
+        echo You may close this window.
         
-        :ErrorExit
-        echo !!! PIPELINE FAILED !!!
-        echo Check the log above for details.
     ) >> "!LOG_FILE!" 2>&1
-    
+
+    :: Display the log on the screen so you can see what happened
     type "!LOG_FILE!"
     pause
     exit
+    
+    :ErrorExit
+    echo.
+    echo !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    echo !!!       JOB FAILED         !!!
+    echo !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    echo.
+    echo See log details above.
+    pause
+    exit
 )
-
-:: ================= HELPER FUNCTIONS =================
-:GET_CPU_USAGE
-:: Initialize to 0 so we never return empty
-set %1=0
-for /f "skip=1" %%p in ('wmic cpu get loadpercentage 2^>nul') do ( 
-    set %1=%%p
-    goto :eof
-)
-goto :eof
-
-:GET_GPU_USAGE
-set %1=0
-where nvidia-smi >nul 2>nul
-if %errorlevel% neq 0 goto :eof
-for /f "tokens=1 delims=," %%g in ('nvidia-smi --query-gpu^=utilization.gpu --format^=csv^,noheader^,nounits') do (
-    set %1=%%g
-    goto :eof
-)
-goto :eof
