@@ -176,7 +176,7 @@ class Tracker:
         so = onnxruntime.SessionOptions()
         so.log_severity_level = 3 # Error only
         so.add_session_config_entry('session.load_model_format', 'ONNX')
-        onnx_weights_path = 'yolov3_training_best.onnx'
+        #onnx_weights_path = 'yolov3_training_best.onnx'
 
         self.network_size = (416, 416)
         self.session = onnxruntime.InferenceSession(onnx_weights_path, sess_options=so,
@@ -920,12 +920,14 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(description="Tracker Headless Mode")
         parser.add_argument('--input_folder', required=True, help="Folder containing 'stitched.mp4' and '*RecordingMeta.xlsx'")
         parser.add_argument('--output_folder', required=True, help="Path to output directory")
+        parser.add_argument('--onnx_weight', required=True, help="Path to output directory")
         
         args = parser.parse_args()
         
         in_p = args.input_folder
         out_p = args.output_folder
-
+        onnx_weight = args.onnx_weight
+        
         # 1. Define Video Path
         vid_p = os.path.join(in_p, 'stitched.mp4')
         if not os.path.exists(vid_p):

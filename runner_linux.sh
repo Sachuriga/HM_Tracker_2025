@@ -5,6 +5,9 @@ ROOT_DIR="$1"
 MAX_CPU_LOAD=80
 MAX_GPU_LOAD=80
 FREQ=30000
+
+ONNX_WEIGHTS_PATH="yolov3_training_best.onnx"
+
 # Initial cooldown to allow a process to ramp up resources before checking again
 RAMP_UP_DELAY=10 
 # ===============================================
@@ -56,7 +59,7 @@ run_pipeline() {
     # Using 'stitched.mp4' from IP folder as input
     if [[ -f "$IP/stitched.mp4" ]]; then
         echo "   [Tracker] Running YOLO..."
-        python3 ./src/TrackerYolov_2025.py -i "$IP/stitched.mp4" -o "$OP" > /dev/null 2>&1
+        python3 ./src/TrackerYolov_2025.py --input_folder "$IP/stitched.mp4" --output_folder "$OP" > /dev/null 2>&1 --onnx_weight "$ONNX_WEIGHTS_PATH"
     else
         echo "   [Warning] $IP/stitched.mp4 not found. Skipping tracking."
     fi
