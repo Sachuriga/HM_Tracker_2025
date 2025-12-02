@@ -56,7 +56,7 @@ run_pipeline() {
     echo "   [Sync] Running Video_LED_Sync..."
     echo "--- RUNNING LED SYNC ---" >> "$LOG_FILE"
     
-    python3 ./src/Video_LED_Sync_using_ICA_sachi.py -i "$IP" -o "$OP" -f "$FREQ" >> "$LOG_FILE" 2>&1
+    python3 ./src/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" -f "$FREQ" >> "$LOG_FILE" 2>&1
     
     # CHECK FOR ERRORS
     if [ $? -ne 0 ]; then
@@ -68,7 +68,7 @@ run_pipeline() {
     fi
 
     # === (Optional) Stitch step ===
-    # python3 ./src/join_views.py "$IP" >> "$LOG_FILE" 2>&1
+    python3 ./src/join_views.py "$IP" >> "$LOG_FILE" 2>&1
 
     # ==== Tracking ====
     if [[ -f "$IP/stitched.mp4" ]]; then
@@ -76,7 +76,7 @@ run_pipeline() {
         echo "--- RUNNING YOLO TRACKER ---" >> "$LOG_FILE"
 
         # FIXED: Moved redirection to the very end so onnx_weight is read correctly
-        python3 ./src/TrackerYolov_2025.py \
+        python3 ./src/TrackerYolov.py \
             --input_folder "$IP/stitched.mp4" \
             --output_folder "$OP" \
             --onnx_weight "$ONNX_WEIGHTS_PATH" >> "$LOG_FILE" 2>&1
@@ -95,7 +95,7 @@ run_pipeline() {
     echo "   [Plotting] Running plot_trials..."
     echo "--- RUNNING PLOTTING ---" >> "$LOG_FILE"
     
-    python3 plot_trials_20251127.py -o "$OP" >> "$LOG_FILE" 2>&1
+    python3 plot_trials.py -o "$OP" >> "$LOG_FILE" 2>&1
     
     if [ $? -ne 0 ]; then
         echo "!!! ERROR in PLOTTING for $IP !!!"
