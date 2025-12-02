@@ -50,17 +50,18 @@ run_pipeline() {
     # Initialize the log file
     echo ">>> PREPARING JOB: Pair $IP -> $OP" > "$LOG_FILE"
 
-    # --- NEW: POP UP WINDOW ---
-    # This opens a new terminal window that monitors the log file created above.
-    # It uses 'tail -f' to stream output.
+    # --- NEW: POP UP WINDOW (FIXED FOR CONDA) ---
+    # We use 'env -u LD_LIBRARY_PATH' to stop the Conda environment from crashing gnome-terminal
     if command -v gnome-terminal &> /dev/null; then
-        # Opens GNOME terminal. The window stays open until you close it.
-        gnome-terminal --title="Running: $JOB_NAME" --geometry=100x24 -- bash -c "tail -f \"$LOG_FILE\"" &
+        # Opens GNOME terminal. 
+        # We strip LD_LIBRARY_PATH so it uses system libs, not Conda libs
+        env -u LD_LIBRARY_PATH -u PYTHONPATH gnome-terminal --title="Running: $JOB_NAME" --geometry=100x24 -- bash -c "tail -f \"$LOG_FILE\"" &
+    
     elif command -v xterm &> /dev/null; then
         # Fallback for xterm
         xterm -T "Running: $JOB_NAME" -e "tail -f \"$LOG_FILE\"" &
     else
-        echo "Warning: No terminal emulator found (gnome-terminal or xterm). Logs will strictly be in files."
+        echo "Warning: No terminal emulator found. Logs will strictly be in files."
     fi
     # --------------------------
 
