@@ -2,8 +2,8 @@
 
 # =================CONFIGURATION=================
 ROOT_DIR="$1"
-MAX_CPU_LOAD=80
-MAX_GPU_LOAD=80
+MAX_CPU_LOAD=95
+MAX_GPU_LOAD=95
 FREQ=20000
 
 ONNX_WEIGHTS_PATH="/home/genzel/Desktop/Documents/Param/yolov3_training_best.onnx"
@@ -38,134 +38,104 @@ get_gpu_usage() {
     fi
 }
 
-# --- NEW: CYCLING DASHBOARD FUNCTION ---
-live_dashboard() {
-    # Give the main script a moment to start jobs before we start looking
-    sleep 5 
-    
-    while true; do
-        # 1. Find logs modified in the last 2 minutes (-mmin -2)
-        # This ensures we only watch jobs that are currently running.
-        ACTIVE_LOGS=$(find "$ROOT_DIR" -name "pipeline_log.txt" -mmin -2)
-
-        # 2. If no logs are active, just show stats and wait
-        if [[ -z "$ACTIVE_LOGS" ]]; then
-            local cpu=$(get_cpu_usage)
-            local gpu=$(get_gpu_usage)
-            echo "   [System Idle] CPU: ${cpu}% | GPU: ${gpu}% (Waiting for active jobs...)"
-            sleep 10
-            continue
-        fi
-
-        # 3. Cycle through each active log
-        for logfile in $ACTIVE_LOGS; do
-            # Get folder name for display (e.g., op1)
-            PARENT_DIR=$(dirname "$logfile")
-            JOB_NAME=$(basename "$PARENT_DIR")
-            
-            local cpu=$(get_cpu_usage)
-            local gpu=$(get_gpu_usage)
-            local timestamp=$(date '+%H:%M:%S')
-
-            # Visual Separator
-            echo "------------------------------------------------------------"
-            echo " [WATCHDOG $timestamp] CPU: ${cpu}% | GPU: ${gpu}%"
-            echo " >>> STREAMING OUTPUT: $JOB_NAME (Switching in 10s)"
-            echo "------------------------------------------------------------"
-
-            # 4. Tail the log for 10 seconds, then kill the tail command
-            # 'timeout' runs the command for X duration.
-            # 'tail -f' follows the file as it grows.
-            timeout 10s tail -n 5 -f "$logfile"
-
-            echo "" # New line for cleanliness
-        done
-    done
-}
-# =============================================
-
 # =================THE PIPELINE WORKER=================
 run_pipeline() {
     local IP="$1"
     local OP="$2"
+    local JOB_NAME=$(basename "$IP")
     local LOG_FILE="$OP/pipeline_log.txt"
     
     mkdir -p "$OP"
     
-    # We output to the LOG_FILE, but we do NOT pipe to stdout here.
-    # The 'live_dashboard' will handle showing us the content.
-    
-    echo ">>> STARTING JOB: Pair $IP -> $OP"
-    echo "================= STARTING PIPELINE $(date) =================" > "$LOG_FILE"
+    # Initialize the log file
+    echo ">>> PREPARING JOB: Pair $IP -> $OP" > "$LOG_FILE"
 
-    # === Extract DIO ===
-    for i in $(find "$IP" -name "*.rec" -type f); do
-        echo "--- RUNNING TRODES: $i ---" >> "$LOG_FILE"
-        /home/genzel/Desktop/Documents/Param/Trodes_2-3-2_Ubuntu2004/trodesexport -dio -rec "$i" >> "$LOG_FILE" 2>&1
-    done
-
-    # === Run Sync Script ===
-    echo "--- RUNNING LED SYNC ---" >> "$LOG_FILE"
-    python3 -u ./src/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" -f "$FREQ" >> "$LOG_FILE" 2>&1
-    
-    if [ ${PIPESTATUS[0]} -ne 0 ]; then
-        echo "!!! ERROR: LED SYNC FAILED ($OP) !!!" >> "$LOG_FILE"
-        return 
+    # --- NEW: POP UP WINDOW ---
+    # This opens a new terminal window that monitors the log file created above.
+    # It uses 'tail -f' to stream output.
+    if command -v gnome-terminal &> /dev/null; then
+        # Opens GNOME terminal. The window stays open until you close it.
+        gnome-terminal --title="Running: $JOB_NAME" --geometry=100x24 -- bash -c "tail -f \"$LOG_FILE\"" &
+    elif command -v xterm &> /dev/null; then
+        # Fallback for xterm
+        xterm -T "Running: $JOB_NAME" -e "tail -f \"$LOG_FILE\"" &
+    else
+        echo "Warning: No terminal emulator found (gnome-terminal or xterm). Logs will strictly be in files."
     fi
+    # --------------------------
 
-    # === Stitch step ===
-    python3 -u ./src/join_views.py "$IP" >> "$LOG_FILE" 2>&1
+    # Redirect ALL output below this line to the log file
+    {
+        echo "================= STARTING PIPELINE $(date) =================" 
 
-    # ==== Tracking ====
-    if [[ -f "$IP/stitched.mp4" ]]; then
-        echo "--- RUNNING YOLO TRACKER ---" >> "$LOG_FILE"
+        # === Extract DIO ===
+        for i in $(find "$IP" -name "*.rec" -type f); do
+            echo "--- RUNNING TRODES: $i ---" 
+            /home/genzel/Desktop/Documents/Param/Trodes_2-3-2_Ubuntu2004/trodesexport -dio -rec "$i" 
+        done
 
-        python3 -u ./src/TrackerYolov.py \
-            --input_folder "$IP/stitched.mp4" \
-            --output_folder "$OP" \
-            --onnx_weight "$ONNX_WEIGHTS_PATH" >> "$LOG_FILE" 2>&1
+        # === Run Sync Script ===
+        echo "--- RUNNING LED SYNC ---" 
+        python3 -u ./src/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" -f "$FREQ" 
+        
+        # Check Sync Status
+        if [ $? -ne 0 ]; then
+            echo "!!! ERROR: LED SYNC FAILED ($OP) !!!" 
+            echo "Check log above for details."
+            return 
+        fi
 
-        if [ ${PIPESTATUS[0]} -ne 0 ]; then
-            echo "!!! ERROR: TRACKER FAILED ($OP) !!!" >> "$LOG_FILE"
+        # === Stitch step ===
+        echo "--- RUNNING STITCHING ---"
+        python3 -u ./src/join_views.py "$IP" 
+
+        # ==== Tracking ====
+        if [[ -f "$IP/stitched.mp4" ]]; then
+            echo "--- RUNNING YOLO TRACKER ---" 
+
+            python3 -u ./src/TrackerYolov.py \
+                --input_folder "$IP/stitched.mp4" \
+                --output_folder "$OP" \
+                --onnx_weight "$ONNX_WEIGHTS_PATH" 
+
+            if [ $? -ne 0 ]; then
+                echo "!!! ERROR: TRACKER FAILED ($OP) !!!" 
+                return
+            fi
+        else
+            echo "   [Warning] $IP/stitched.mp4 not found. Skipping tracking." 
+        fi
+
+        # ==== Plotting ====
+        echo "--- RUNNING PLOTTING ---" 
+        python3 -u plot_trials.py -o "$OP" 
+        
+        if [ $? -ne 0 ]; then
+            echo "!!! ERROR: PLOTTING FAILED ($OP) !!!" 
             return
         fi
-    else
-        echo "   [Warning] $IP/stitched.mp4 not found. Skipping tracking." >> "$LOG_FILE"
-    fi
 
-    # ==== Plotting ====
-    echo "--- RUNNING PLOTTING ---" >> "$LOG_FILE"
-    python3 -u plot_trials.py -o "$OP" >> "$LOG_FILE" 2>&1
-    
-    if [ ${PIPESTATUS[0]} -ne 0 ]; then
-        echo "!!! ERROR: PLOTTING FAILED ($OP) !!!" >> "$LOG_FILE"
-        return
-    fi
-
-    # ==== Compression ====
-    VIDEO_FILE=$(ls "$OP"/*.mp4 2>/dev/null | head -n 1)
-    if [[ -n "$VIDEO_FILE" ]]; then
-        echo "--- RUNNING COMPRESSION ---" >> "$LOG_FILE"
-        TEMP_FILE="$OP/__temp_compressed.mp4"
-        ffmpeg -y -hide_banner -loglevel warning -i "$VIDEO_FILE" -vcodec h264_nvenc -qp 30 "$TEMP_FILE" >> "$LOG_FILE" 2>&1
-        if [[ -f "$TEMP_FILE" ]]; then
-            mv -f "$TEMP_FILE" "$VIDEO_FILE"
+        # ==== Compression ====
+        VIDEO_FILE=$(ls "$OP"/*.mp4 2>/dev/null | head -n 1)
+        if [[ -n "$VIDEO_FILE" ]]; then
+            echo "--- RUNNING COMPRESSION ---" 
+            TEMP_FILE="$OP/__temp_compressed.mp4"
+            ffmpeg -y -hide_banner -loglevel warning -i "$VIDEO_FILE" -vcodec h264_nvenc -qp 30 "$TEMP_FILE" 
+            if [[ -f "$TEMP_FILE" ]]; then
+                mv -f "$TEMP_FILE" "$VIDEO_FILE"
+            fi
         fi
-    fi
 
-    echo "================= FINISHED $(date) =================" >> "$LOG_FILE"
+        echo "================= FINISHED $(date) =================" 
+        echo " You may close this window now."
+
+    } >> "$LOG_FILE" 2>&1
 }
 
 # =================MAIN MANAGER LOOP=================
 
 echo "Scanning $ROOT_DIR for ip/op pairs..."
-
-# --- START BACKGROUND DASHBOARD ---
-echo "Starting Live Log Switcher..."
-live_dashboard &          # Run in background
-MONITOR_PID=$!            # Save the Process ID
-trap "kill $MONITOR_PID" EXIT # Kill it when script ends
-# --------------------------------
+echo "Main Monitor Running (Job details will appear in pop-up windows)..."
 
 # Find directory pairs
 find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH; do
@@ -182,13 +152,14 @@ find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH;
             CURRENT_GPU=$(get_gpu_usage)
             JOBS_RUNNING=$(jobs -r | wc -l)
 
-            # Note: We removed the print statement here because the dashboard is handling output.
-            # Only print if we are actually blocked.
+            # Print status to main terminal
+            echo -ne "System Status: CPU ${CURRENT_CPU}% | GPU ${CURRENT_GPU}% | Jobs Active: ${JOBS_RUNNING}\r"
             
             if (( CURRENT_CPU < MAX_CPU_LOAD )) && (( CURRENT_GPU < MAX_GPU_LOAD )); then
+                echo "" # New line to clear the carriage return
                 break
             else
-                # If busy, just wait silently (dashboard will show high CPU)
+                # If busy, wait
                 if [[ "$JOBS_RUNNING" -gt 0 ]]; then
                     wait -n
                 else
@@ -198,14 +169,12 @@ find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH;
         done
 
         # === LAUNCH JOB ===
-        # We don't print "Found Next Candidate" to stdout to keep the dashboard clean
-        # The dashboard will pick it up once the log file is created.
+        echo "Launching Job: $DIR_NAME..."
         run_pipeline "$IP_PATH" "$OP_PATH" &
         
         sleep "$RAMP_UP_DELAY"
         
     else
-        # Log silent errors to a global error log if needed, or stderr
         echo "Skipping $DIR_NAME: Corresponding $OP_PATH not found." >&2
     fi
 done
