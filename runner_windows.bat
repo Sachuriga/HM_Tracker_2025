@@ -1,210 +1,181 @@
-<#
-.SYNOPSIS
-    Windows PowerShell equivalent of the batch runner pipeline.
-.DESCRIPTION
-    Scans for ip/op folders, monitors CPU/GPU usage, and launches jobs in new windows.
-.PARAMETER RootDir
-    The path to the data folder containing ip* directories.
-#>
+@echo off
+setlocal EnableDelayedExpansion
 
-param(
-    [Parameter(Mandatory=$true)]
-    [string]$RootDir
+:: ================= CONFIGURATION =================
+:: SET YOUR PATHS HERE (No spaces around the = sign)
+set "TRODES_BIN=C:\Path\To\Trodes_2-3-2\trodesexport.exe"
+set "ONNX_WEIGHTS_PATH=C:\Users\genzel\Desktop\Documents\Param\yolov3_training_best.onnx"
+
+set MAX_CPU_LOAD=95
+set MAX_GPU_LOAD=95
+set FREQ=30000
+set RAMP_UP_DELAY=10
+:: =================================================
+
+:: 1. Check if Root Directory is provided
+if "%~1"=="" (
+    echo Usage: batch_runner.bat "path_to_data_folder"
+    exit /b 1
+)
+set "ROOT_DIR=%~1"
+
+echo Scanning %ROOT_DIR% for ip/op pairs...
+echo Main Monitor Running (Job details will appear in pop-up windows)...
+
+:: ================= MAIN LOOP =================
+:: Loop through all directories starting with "ip"
+for /d %%D in ("%ROOT_DIR%\ip*") do (
+    set "IP_PATH=%%~fD"
+    set "DIR_NAME=%%~nD"
+    
+    :: Extract the number from "ipX" to find "opX"
+    set "NUM=!DIR_NAME:ip=!"
+    set "OP_PATH=%ROOT_DIR%\op!NUM!"
+
+    if exist "!OP_PATH!" (
+        
+        :: === PRE-LAUNCH RESOURCE CHECK LOOP ===
+        :CHECK_RESOURCES
+        call :GET_CPU_USAGE CURRENT_CPU
+        call :GET_GPU_USAGE CURRENT_GPU
+        
+        :: Print Status (uses <nul set /p to print on same line, sort of)
+        cls
+        echo Processing: !DIR_NAME!
+        echo System Status: CPU !CURRENT_CPU!%% ^| GPU !CURRENT_GPU!%%
+        echo Waiting for resources...
+
+        if !CURRENT_CPU! LSS %MAX_CPU_LOAD% (
+            if !CURRENT_GPU! LSS %MAX_GPU_LOAD% (
+                goto :LAUNCH_JOB
+            )
+        )
+        
+        :: Wait 10 seconds before checking again
+        timeout /t 10 /nobreak >nul
+        goto :CHECK_RESOURCES
+
+        :LAUNCH_JOB
+        echo Launching Job: !DIR_NAME!
+        
+        :: LAUNCH NEW WINDOW
+        :: "start" opens a new window. 
+        :: We pass arguments to THIS script but jump to the :WORKER label.
+        start "Job: !DIR_NAME!" cmd /c "%~f0" :WORKER "!IP_PATH!" "!OP_PATH!"
+        
+        :: Ramp up delay
+        timeout /t %RAMP_UP_DELAY% /nobreak >nul
+        
+    ) else (
+        echo Skipping !DIR_NAME!: Corresponding !OP_PATH! not found.
+    )
 )
 
-# ================= CONFIGURATION =================
-# CRITICAL: Update these paths for your Windows machine!
-$TRODES_BIN = "C:\Path\To\Trodes_2-3-2\trodesexport.exe" 
-$ONNX_WEIGHTS_PATH = "C:\Users\genzel\Desktop\Documents\Param\yolov3_training_best.onnx"
+echo All pairs queued.
+pause
+exit /b 0
 
-$MAX_CPU_LOAD = 80
-$MAX_GPU_LOAD = 80
-$FREQ = 20000
-$RAMP_UP_DELAY = 10 
-# =================================================
+:: =======================================================
+::                   WORKER PROCESS
+:: This section runs inside the POP-UP window
+:: =======================================================
+:WORKER
+if "%1"==":WORKER" (
+    set "IP=%~2"
+    set "OP=%~3"
+    set "LOG_FILE=%~3\pipeline_log.txt"
 
-# Ensure RootDir is valid
-if (-not (Test-Path -Path $RootDir)) {
-    Write-Host "Error: Directory '$RootDir' does not exist." -ForegroundColor Red
-    exit 1
-}
+    if not exist "%~3" mkdir "%~3"
 
-# ================= FUNCTIONS =================
-
-function Get-CpuUsage {
-    # Uses WMI to get current CPU load percentage
-    $cpu = Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average
-    return [math]::Round($cpu.Average)
-}
-
-function Get-GpuUsage {
-    if (Get-Command "nvidia-smi" -ErrorAction SilentlyContinue) {
-        try {
-            # Query NVIDIA SMI, parse CSV output
-            $gpu = nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits
-            # Take the first GPU found
-            $gpu = $gpu -split "`r`n" | Select-Object -First 1
-            return [int]$gpu
-        }
-        catch {
-            return 0
-        }
-    }
-    return 0
-}
-
-# This block defines the code that will run inside the pop-up windows
-$WorkerScriptBlock = {
-    param($Ip, $Op, $Freq, $TrodesBin, $OnnxPath)
-
-    $ErrorActionPreference = "Stop"
-    $LogFile = Join-Path -Path $Op -ChildPath "pipeline_log.txt"
+    echo ^>^>^> PREPARING JOB: Pair !IP! -^> !OP! > "!LOG_FILE!"
     
-    # Create Output Directory
-    New-Item -ItemType Directory -Force -Path $Op | Out-Null
+    :: We use a block (parentheses) to redirect ALL output to log
+    (
+        echo ================= STARTING PIPELINE %DATE% %TIME% =================
 
-    # Start logging to file AND console (Transcripts are PowerShell's "tail -f" equivalent)
-    Start-Transcript -Path $LogFile -Force
+        :: === Extract DIO ===
+        for /r "%IP%" %%f in (*.rec) do (
+            echo --- RUNNING TRODES: %%~nxf ---
+            "%TRODES_BIN%" -dio -rec "%%f"
+        )
 
-    Write-Host ">>> PREPARING JOB: Pair $Ip -> $Op" -ForegroundColor Cyan
-    Write-Host "================= STARTING PIPELINE $(Get-Date) ================="
+        :: === Run Sync Script ===
+        echo --- RUNNING LED SYNC ---
+        python -u ./src/Video_LED_Sync_using_ICA.py -i "%IP%" -o "%OP%" -f %FREQ%
+        if errorlevel 1 (
+            echo !!! ERROR: LED SYNC FAILED !!!
+            goto :EndWorker
+        )
 
-    try {
-        # === Extract DIO (Trodes) ===
-        $recFiles = Get-ChildItem -Path $Ip -Filter "*.rec" -Recurse
-        foreach ($file in $recFiles) {
-            Write-Host "--- RUNNING TRODES: $($file.Name) ---" -ForegroundColor Yellow
-            # Call executable using call operator &
-            & $TrodesBin -dio -rec "$($file.FullName)"
-        }
+        :: === Stitch Step ===
+        echo --- RUNNING STITCHING ---
+        python -u ./src/join_views.py "%IP%"
 
-        # === Run Sync Script ===
-        Write-Host "--- RUNNING LED SYNC ---" -ForegroundColor Yellow
-        # Using python -u for unbuffered output
-        python -u ./src/Video_LED_Sync_using_ICA.py -i "$Ip" -o "$Op" -f "$Freq"
-        if ($LASTEXITCODE -ne 0) { throw "LED SYNC FAILED" }
+        :: === Tracking ===
+        if exist "%IP%\stitched.mp4" (
+            echo --- RUNNING YOLO TRACKER ---
+            python -u ./src/TrackerYolov.py --input_folder "%IP%\stitched.mp4" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
+            if errorlevel 1 (
+                echo !!! ERROR: TRACKER FAILED !!!
+                goto :EndWorker
+            )
+        ) else (
+            echo [Warning] stitched.mp4 not found. Skipping tracking.
+        )
 
-        # === Stitch step ===
-        Write-Host "--- RUNNING STITCHING ---" -ForegroundColor Yellow
-        python -u ./src/join_views.py "$Ip"
+        :: === Plotting ===
+        echo --- RUNNING PLOTTING ---
+        python -u plot_trials.py -o "%OP%"
+        if errorlevel 1 (
+            echo !!! ERROR: PLOTTING FAILED !!!
+            goto :EndWorker
+        )
 
-        # === Tracking ===
-        $StitchedVideo = Join-Path $Ip "stitched.mp4"
-        if (Test-Path $StitchedVideo) {
-            Write-Host "--- RUNNING YOLO TRACKER ---" -ForegroundColor Yellow
-            python -u ./src/TrackerYolov.py `
-                --input_folder "$StitchedVideo" `
-                --output_folder "$Op" `
-                --onnx_weight "$OnnxPath"
-            
-            if ($LASTEXITCODE -ne 0) { throw "TRACKER FAILED" }
-        } else {
-            Write-Host "   [Warning] stitched.mp4 not found. Skipping tracking." -ForegroundColor Magenta
-        }
+        :: === Compression ===
+        for %%v in ("%OP%\*.mp4") do (
+            echo --- RUNNING COMPRESSION ---
+            ffmpeg -y -hide_banner -loglevel warning -i "%%v" -vcodec h264_nvenc -qp 30 "%OP%\__temp_compressed.mp4"
+            if exist "%OP%\__temp_compressed.mp4" (
+                move /y "%OP%\__temp_compressed.mp4" "%%v"
+            )
+            :: Break after first video found (matches original script logic)
+            goto :CompDone
+        )
+        :CompDone
 
-        # === Plotting ===
-        Write-Host "--- RUNNING PLOTTING ---" -ForegroundColor Yellow
-        python -u plot_trials.py -o "$Op"
-        if ($LASTEXITCODE -ne 0) { throw "PLOTTING FAILED" }
+        echo ================= FINISHED %DATE% %TIME% =================
+        echo You may close this window now.
 
-        # === Compression (FFmpeg) ===
-        $VideoFile = Get-ChildItem -Path $Op -Filter "*.mp4" | Select-Object -First 1
-        if ($VideoFile) {
-            Write-Host "--- RUNNING COMPRESSION ---" -ForegroundColor Yellow
-            $TempFile = Join-Path $Op "__temp_compressed.mp4"
-            
-            # FFmpeg call
-            ffmpeg -y -hide_banner -loglevel warning -i "$($VideoFile.FullName)" -vcodec h264_nvenc -qp 30 "$TempFile"
-            
-            if (Test-Path $TempFile) {
-                Move-Item -Path $TempFile -Destination "$($VideoFile.FullName)" -Force
-            }
-        }
+    ) >> "!LOG_FILE!" 2>&1
 
-        Write-Host "================= FINISHED $(Get-Date) =================" -ForegroundColor Green
-        Write-Host "You may close this window now."
-    }
-    catch {
-        Write-Host "!!! ERROR: $($_.Exception.Message) !!!" -ForegroundColor Red
-        Write-Host "Check log file: $LogFile"
-    }
-    finally {
-        Stop-Transcript
-        # Keep window open for review, similar to the bash script behavior
-        Read-Host "Press Enter to exit..."
-    }
-}
+    :: Also tail the log to the screen so user sees it
+    type "!LOG_FILE!"
+    
+    :EndWorker
+    pause
+    exit
+)
 
-# ================= MAIN MANAGER LOOP =================
+:: ================= HELPER FUNCTIONS =================
 
-Write-Host "Scanning $RootDir for ip/op pairs..." -ForegroundColor Cyan
-Write-Host "Main Monitor Running (Job details will appear in pop-up windows)..."
+:GET_CPU_USAGE
+:: Parse WMIC output to get CPU Load
+for /f "skip=1" %%p in ('wmic cpu get loadpercentage') do ( 
+    set %1=%%p
+    goto :eof
+)
+goto :eof
 
-# Find directory pairs
-$ipDirs = Get-ChildItem -Path $RootDir -Directory -Filter "ip*" | Sort-Object Name
-
-# List to keep track of active jobs
-$ActiveProcesses = @()
-
-foreach ($ipDir in $ipDirs) {
-    $DirName = $ipDir.Name
-    # Extract number (remove 'ip' prefix)
-    $Num = $DirName -replace "ip",""
-    $OpPath = Join-Path $RootDir ("op" + $Num)
-
-    if (Test-Path $OpPath) {
-        
-        # === PRE-LAUNCH RESOURCE CHECK LOOP ===
-        while ($true) {
-            $CurrentCpu = Get-CpuUsage
-            $CurrentGpu = Get-GpuUsage
-            
-            # Clean up finished processes from our tracking list
-            $ActiveProcesses = $ActiveProcesses | Where-Object { -not $_.HasExited }
-            $JobCount = $ActiveProcesses.Count
-
-            # Update Status Line (Write-Host with NoNewline to update in place)
-            Write-Host -NoNewline "`rSystem Status: CPU ${CurrentCpu}% | GPU ${CurrentGpu}% | Jobs Active: ${JobCount}   "
-
-            if (($CurrentCpu -lt $MAX_CPU_LOAD) -and ($CurrentGpu -lt $MAX_GPU_LOAD)) {
-                Write-Host "" # New line to clear buffer
-                break
-            } else {
-                # If resources busy or max jobs, wait
-                if ($JobCount -gt 0) {
-                    Start-Sleep -Seconds 5
-                } else {
-                    Start-Sleep -Seconds 10
-                }
-            }
-        }
-
-        # === LAUNCH JOB ===
-        Write-Host "Launching Job: $DirName..." -ForegroundColor Green
-        
-        # We convert the ScriptBlock to a string encoded for the CLI to pass it cleanly to the new window
-        $EncodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($WorkerScriptBlock.ToString()))
-        
-        # Prepare arguments list
-        # Note: We must pass the variables explicitly into the script block
-        $CommandStr = "& { $WorkerScriptBlock } -Ip '$($ipDir.FullName)' -Op '$OpPath' -Freq $FREQ -TrodesBin '$TRODES_BIN' -OnnxPath '$ONNX_WEIGHTS_PATH'"
-
-        # Launch new PowerShell window
-        $p = Start-Process powershell -ArgumentList "-NoExit", "-Command", $CommandStr -PassThru
-        
-        # Add to tracking list
-        $ActiveProcesses += $p
-
-        Start-Sleep -Seconds $RAMP_UP_DELAY
-
-    } else {
-        Write-Host "Skipping $DirName: Corresponding $OpPath not found." -ForegroundColor DarkGray
-    }
-}
-
-Write-Host "All pairs queued. Waiting for remaining jobs to finish..." -ForegroundColor Cyan
-# Wait for all tracked processes to exit
-while (($ActiveProcesses | Where-Object { -not $_.HasExited }).Count -gt 0) {
-    Start-Sleep -Seconds 2
-}
-Write-Host "All Done." -ForegroundColor Green
+:GET_GPU_USAGE
+:: Parse NVIDIA-SMI output
+where nvidia-smi >nul 2>nul
+if %errorlevel% neq 0 (
+    set %1=0
+    goto :eof
+)
+for /f "tokens=1 delims=," %%g in ('nvidia-smi --query-gpu^=utilization.gpu --format^=csv^,noheader^,nounits') do (
+    set %1=%%g
+    goto :eof
+)
+set %1=0
+goto :eof
