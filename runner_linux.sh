@@ -6,7 +6,7 @@ MAX_CPU_LOAD=80
 MAX_GPU_LOAD=80
 FREQ=30000
 
-ONNX_WEIGHTS_PATH="yolov3_training_best.onnx"
+ONNX_WEIGHTS_PATH="/home/genzel/Desktop/Documents/Param/Track_sachi/yolov3_training_best.onnx"
 
 # Initial cooldown to allow a process to ramp up resources before checking again
 RAMP_UP_DELAY=10 
@@ -42,7 +42,6 @@ run_pipeline() {
     echo ">>> STARTING JOB: Pair $IP -> $OP"
 
     # === Extract DIO using Trodes ===
-    # Note: Using subshell or specific find to ensure we look inside the specific IP folder
     for i in $(find "$IP" -name "*.rec" -type f); do
         echo "   [Trodes] Processing: $i"
         ./Trodes_2-3-2_Ubuntu2004/trodesexport -dio -rec "$i" > /dev/null 2>&1
@@ -56,7 +55,6 @@ run_pipeline() {
     # python3 ./src/join_views.py "$IP"
 
     # ==== Tracking ====
-    # Using 'stitched.mp4' from IP folder as input
     if [[ -f "$IP/stitched.mp4" ]]; then
         echo "   [Tracker] Running YOLO..."
         python3 ./src/TrackerYolov_2025.py --input_folder "$IP/stitched.mp4" --output_folder "$OP" > /dev/null 2>&1 --onnx_weight "$ONNX_WEIGHTS_PATH"
@@ -91,38 +89,48 @@ run_pipeline() {
 echo "Scanning $ROOT_DIR for ip/op pairs..."
 
 # Find directory pairs
-# We look for folders starting with 'ip' inside ROOT_DIR
 find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH; do
     
     # Extract the folder name (e.g., ip1)
     DIR_NAME=$(basename "$IP_PATH")
     
     # Extract the number (e.g., 1 from ip1)
-    # ${var#prefix} removes prefix
     NUM="${DIR_NAME#ip}"
     
     # Construct expected Output Path
     OP_PATH="$ROOT_DIR/op$NUM"
 
     if [[ -d "$OP_PATH" ]]; then
-        echo "Found Pair: $DIR_NAME -> op$NUM"
+        echo "--------------------------------------------------------"
+        echo "Found Next Candidate: $DIR_NAME -> op$NUM"
         
         # === RESOURCE CHECK LOOP ===
         while true; do
             CURRENT_CPU=$(get_cpu_usage)
             CURRENT_GPU=$(get_gpu_usage)
+            
+            # --- NEW: TRACKING LOGIC ---
+            # Count running background jobs
+            JOBS_RUNNING=$(jobs -r | wc -l)
 
-            echo "   Status - CPU: $CURRENT_CPU% | GPU: $CURRENT_GPU% (Limit: $MAX_CPU_LOAD%)"
+            echo "   [SYSTEM STATUS]"
+            echo "   Resources: CPU: $CURRENT_CPU% | GPU: $CURRENT_GPU% (Limit: $MAX_CPU_LOAD%)"
+            echo "   Active Jobs: $JOBS_RUNNING"
+            
+            if [[ "$JOBS_RUNNING" -gt 0 ]]; then
+                echo "   Currently Running Programs:"
+                # This grabs the active jobs, strips the function name, and cleans up quotes/ampersands to show just folders
+                jobs -r | sed 's/.*run_pipeline//' | tr -d '&' | awk '{print "     >> IP: " $1 " | OP: " $2}'
+            fi
+            echo "   ---------------------------"
+            # ---------------------------
 
             if (( CURRENT_CPU < MAX_CPU_LOAD )) && (( CURRENT_GPU < MAX_GPU_LOAD )); then
                 # Resources are OK, break loop and start job
                 break
             else
                 # Resources too high. Check if any background jobs are running.
-                # If jobs are running, wait for one to finish using 'wait -n' (efficient)
-                # If no jobs are running but load is high (external process), sleep manually.
                 
-                JOBS_RUNNING=$(jobs -r | wc -l)
                 if [[ "$JOBS_RUNNING" -gt 0 ]]; then
                     echo "   Resources busy. Waiting for a task to finish..."
                     wait -n
@@ -134,6 +142,7 @@ find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH;
         done
 
         # === LAUNCH JOB IN BACKGROUND ===
+        # run_pipeline is launched with specific arguments, which allows 'jobs' command to track them
         run_pipeline "$IP_PATH" "$OP_PATH" &
         
         # Sleep briefly to let the new process spike the CPU/GPU load 
