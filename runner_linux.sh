@@ -18,9 +18,9 @@ if [[ -z "$ROOT_DIR" ]]; then
     exit 1
 fi
 
-# Function to get current CPU usage
 get_cpu_usage() {
-    top -bn2 -d 0.5 | grep "Cpu(s)" | tail -n 1 | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}' | awk '{printf "%.0f", $1}'
+    # LC_ALL=C ensures 'top' output is in standard English with dot decimals
+    LC_ALL=C top -bn2 -d 0.5 | grep "Cpu(s)" | tail -n 1 | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}' | awk '{printf "%.0f", $1}'
 }
 
 # Function to get current GPU usage
