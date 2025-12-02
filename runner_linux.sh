@@ -6,7 +6,7 @@ MAX_CPU_LOAD=80
 MAX_GPU_LOAD=80
 FREQ=20000
 
-ONNX_WEIGHTS_PATH="/home/genzel/Desktop/Documents/Param/Track_sachi/yolov3_training_best.onnx"
+ONNX_WEIGHTS_PATH="/home/genzel/Desktop/Documents/Param/yolov3_training_best.onnx"
 
 # Initial cooldown to allow a process to ramp up resources
 RAMP_UP_DELAY=10 
@@ -101,7 +101,7 @@ run_pipeline() {
     # === Extract DIO ===
     for i in $(find "$IP" -name "*.rec" -type f); do
         echo "--- RUNNING TRODES: $i ---" >> "$LOG_FILE"
-        ./Trodes_2-3-2_Ubuntu2004/trodesexport -dio -rec "$i" >> "$LOG_FILE" 2>&1
+        /home/genzel/Desktop/Documents/Param/Trodes_2-3-2_Ubuntu2004/trodesexport -dio -rec "$i" >> "$LOG_FILE" 2>&1
     done
 
     # === Run Sync Script ===
