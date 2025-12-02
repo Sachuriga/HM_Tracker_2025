@@ -50,58 +50,56 @@ run_pipeline() {
         echo "   [Trodes] Processing: $i"
         echo "--- RUNNING TRODES: $i ---" >> "$LOG_FILE"
         
-        ./Trodes_2-3-2_Ubuntu2004/trodesexport -dio -rec "$i" >> "$LOG_FILE" 2>&1
+        # Using tee to show output on screen AND save to file
+        ./Trodes_2-3-2_Ubuntu2004/trodesexport -dio -rec "$i" 2>&1 | tee -a "$LOG_FILE"
     done
 
     # === Run Sync Script ===
     echo "   [Sync] Running Video_LED_Sync..."
     echo "--- RUNNING LED SYNC ---" >> "$LOG_FILE"
     
-    python3 ./src/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" -f "$FREQ" >> "$LOG_FILE" 2>&1
+    # -u ensures python output is not buffered (crucial for progress bars)
+    python3 -u ./src/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" -f "$FREQ" 2>&1 | tee -a "$LOG_FILE"
     
-    # CHECK FOR ERRORS
-    if [ $? -ne 0 ]; then
+    # Capture the exit status of the FIRST command in the pipe (python), not tee
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
         echo "!!! ERROR in LED SYNC for $IP !!!"
         echo "    Check log: $LOG_FILE"
-        echo "    Last 5 lines of error:"
-        tail -n 5 "$LOG_FILE"
         return # Stop this specific pipeline
     fi
 
     # === (Optional) Stitch step ===
-    python3 ./src/join_views.py "$IP" >> "$LOG_FILE" 2>&1
+    # Using -u + tee
+    python3 -u ./src/join_views.py "$IP" 2>&1 | tee -a "$LOG_FILE"
 
     # ==== Tracking ====
     if [[ -f "$IP/stitched.mp4" ]]; then
         echo "   [Tracker] Running YOLO..."
         echo "--- RUNNING YOLO TRACKER ---" >> "$LOG_FILE"
 
-        # FIXED: Moved redirection to the very end so onnx_weight is read correctly
-        python3 ./src/TrackerYolov.py \
+        python3 -u ./src/TrackerYolov.py \
             --input_folder "$IP/stitched.mp4" \
             --output_folder "$OP" \
-            --onnx_weight "$ONNX_WEIGHTS_PATH" >> "$LOG_FILE" 2>&1
+            --onnx_weight "$ONNX_WEIGHTS_PATH" 2>&1 | tee -a "$LOG_FILE"
 
-        if [ $? -ne 0 ]; then
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
             echo "!!! ERROR in YOLO TRACKER for $IP !!!"
             echo "    Check log: $LOG_FILE"
-            tail -n 5 "$LOG_FILE"
             return
         fi
     else
-        echo "   [Warning] $IP/stitched.mp4 not found. Skipping tracking." >> "$LOG_FILE"
+        echo "   [Warning] $IP/stitched.mp4 not found. Skipping tracking." | tee -a "$LOG_FILE"
     fi
 
     # ==== Plotting ====
     echo "   [Plotting] Running plot_trials..."
     echo "--- RUNNING PLOTTING ---" >> "$LOG_FILE"
     
-    python3 plot_trials.py -o "$OP" >> "$LOG_FILE" 2>&1
+    python3 -u plot_trials.py -o "$OP" 2>&1 | tee -a "$LOG_FILE"
     
-    if [ $? -ne 0 ]; then
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
         echo "!!! ERROR in PLOTTING for $IP !!!"
         echo "    Check log: $LOG_FILE"
-        tail -n 5 "$LOG_FILE"
         return
     fi
 
@@ -113,7 +111,8 @@ run_pipeline() {
         echo "--- RUNNING COMPRESSION ---" >> "$LOG_FILE"
         TEMP_FILE="$OP/__temp_compressed.mp4"
         
-        ffmpeg -y -hide_banner -loglevel warning -i "$VIDEO_FILE" -vcodec h264_nvenc -qp 30 "$TEMP_FILE" >> "$LOG_FILE" 2>&1
+        # FFmpeg output is stderr usually, 2>&1 captures it.
+        ffmpeg -y -hide_banner -loglevel warning -i "$VIDEO_FILE" -vcodec h264_nvenc -qp 30 "$TEMP_FILE" 2>&1 | tee -a "$LOG_FILE"
 
         if [[ -f "$TEMP_FILE" ]]; then
             mv -f "$TEMP_FILE" "$VIDEO_FILE"
@@ -171,6 +170,8 @@ find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH;
         done
 
         # === LAUNCH JOB IN BACKGROUND ===
+        # NOTE: Because we are using tee now, if multiple jobs run at once,
+        # their output will mix together on the screen.
         run_pipeline "$IP_PATH" "$OP_PATH" &
         
         sleep "$RAMP_UP_DELAY"
