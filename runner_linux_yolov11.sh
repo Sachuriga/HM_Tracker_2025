@@ -5,7 +5,7 @@ ROOT_DIR="$1"
 # 注意：现在脚本主要由 GPU 数量限制并发，这 CPU 阈值作为二级保险
 MAX_CPU_LOAD=95 
 FREQ=20000
-
+PYTHON_EXEC="/home/sachuriga/yolov12x/bin/python3"
 ONNX_WEIGHTS_PATH="/home/genzel/Desktop/Documents/Param/yolov3_training_best.onnx"
 
 # Initial cooldown to allow a process to ramp up resources
@@ -49,6 +49,9 @@ get_cpu_usage() {
 
 # =================THE PIPELINE WORKER=================
 run_pipeline() {
+
+    source ~/yolov12x/bin/activate
+
     local IP="$1"
     local OP="$2"
     local ASSIGNED_GPU_ID="$3"  # 接收分配的 GPU ID
@@ -76,12 +79,12 @@ run_pipeline() {
         # === Extract DIO ===
         for i in $(find "$IP" -name "*.rec" -type f); do
             echo "--- RUNNING TRODES: $i ---" 
-            /home/genzel/Desktop/Documents/Param/Trodes_2-3-2_Ubuntu2004/trodesexport -dio -rec "$i" 
+            #/home/genzel/Desktop/Documents/Param/Trodes_2-3-2_Ubuntu2004/trodesexport -dio -rec "$i" 
         done
 
         # === Run Sync Script ===
         echo "--- RUNNING LED SYNC ---" 
-        python3 -u ./src/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" -f "$FREQ" 
+        #"$PYTHON_EXEC" -u src/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" -f "$FREQ" 
         
         if [ $? -ne 0 ]; then
             echo "!!! ERROR: LED SYNC FAILED ($OP) !!!" 
@@ -90,7 +93,7 @@ run_pipeline() {
 
         # === Stitch step ===
         echo "--- RUNNING STITCHING ---"
-        python3 -u ./src/join_views.py "$IP" 
+        #"$PYTHON_EXEC" -u ./src/join_views.py "$IP" 
 
         # ==== Tracking ====
         if [[ -f "$IP/stitched.mp4" ]]; then
@@ -98,7 +101,7 @@ run_pipeline() {
 
             # IMPORTANT: 这里传入了 --gpu_id 参数
             # 请确保你的 TrackerYolov11.py 已经按照上一个回答修改以接受此参数
-            python3 -u ./src/TrackerYolov11.py \
+            "$PYTHON_EXEC" -u src/TrackerYolov11.py \
                 --input_folder "$IP/stitched.mp4" \
                 --output_folder "$OP" \
                 --onnx_weight "$ONNX_WEIGHTS_PATH" \
@@ -114,7 +117,7 @@ run_pipeline() {
 
         # ==== Plotting ====
         echo "--- RUNNING PLOTTING ---" 
-        python3 -u plot_trials.py -o "$OP" 
+        "$PYTHON_EXEC" -u src/plot_trials.py -o "$OP" 
         
         # ==== Compression ====
         # 注意：ffmpeg 也可以指定 GPU，如果需要硬件加速编码，
