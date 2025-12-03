@@ -95,7 +95,7 @@ run_pipeline() {
             echo "--- RUNNING YOLO TRACKER ---" 
 
             python3 -u ./src/TrackerYolov.py \
-                --input_folder "$IP/stitched.mp4" \
+                --input_folder "$IP" \
                 --output_folder "$OP" \
                 --onnx_weight "$ONNX_WEIGHTS_PATH" 
 

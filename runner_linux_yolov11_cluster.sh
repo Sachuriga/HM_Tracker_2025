@@ -2,14 +2,18 @@
 
 # =================CONFIGURATION=================
 ROOT_DIR="$1"
-# 注意：现在脚本主要由 GPU 数量限制并发，这 CPU 阈值作为二级保险
 MAX_CPU_LOAD=95 
 FREQ=20000
 PYTHON_EXEC="/home/sachuriga/yolov12x/bin/python3"
-ONNX_WEIGHTS_PATH="/home/genzel/Desktop/Documents/Param/yolov3_training_best.onnx"
+ONNX_WEIGHTS_PATH="/home//sachuriga/data/yolov_models/rat_yolov12_drive_run7/weights/best.pt"
+
+# --- NEW SETTING: GPU IDLE THRESHOLD ---
+# If a GPU is using more than this amount of VRAM (in MiB), consider it BUSY.
+# Set to ~1000-2000 to allow for basic desktop display usage, but catch training jobs.
+GPU_MEM_THRESHOLD=1500 
 
 # Initial cooldown to allow a process to ramp up resources
-RAMP_UP_DELAY=5
+RAMP_UP_DELAY=10
 # ===============================================
 
 # 1. Check if Root Directory is provided
@@ -18,18 +22,17 @@ if [[ -z "$ROOT_DIR" ]]; then
     exit 1
 fi
 
-# === NEW: DETECT GPUS ===
-# 获取系统中的 GPU 数量
+# === DETECT GPUS ===
 if command -v nvidia-smi &> /dev/null; then
     NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
     echo "Detected $NUM_GPUS NVIDIA GPU(s)."
 else
     NUM_GPUS=0
-    echo "No NVIDIA GPUs detected. Logic will default to CPU or fail if GPU is required."
+    echo "No NVIDIA GPUs detected. Script will likely fail."
+    exit 1
 fi
 
-# 初始化 GPU 状态数组，用来存储当前占用该 GPU 的进程 PID
-# GPU_PIDS[0] 存储占用 GPU 0 的任务 PID，以此类推
+# Initialize array to track OUR script's processes
 declare -a GPU_PIDS
 for ((i=0; i<NUM_GPUS; i++)); do
     GPU_PIDS[$i]=""
@@ -47,6 +50,12 @@ get_cpu_usage() {
     fi
 }
 
+get_gpu_memory_usage() {
+    local gpu_id=$1
+    # Returns memory used in MiB as an integer
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu_id"
+}
+
 # =================THE PIPELINE WORKER=================
 run_pipeline() {
 
@@ -54,7 +63,7 @@ run_pipeline() {
 
     local IP="$1"
     local OP="$2"
-    local ASSIGNED_GPU_ID="$3"  # 接收分配的 GPU ID
+    local ASSIGNED_GPU_ID="$3"
     local JOB_NAME=$(basename "$IP")
     local LOG_FILE="$OP/pipeline_log.txt"
     
@@ -63,14 +72,12 @@ run_pipeline() {
     # Initialize the log file
     echo ">>> PREPARING JOB: Pair $IP -> $OP (On GPU: $ASSIGNED_GPU_ID)" > "$LOG_FILE"
 
-    # --- NEW: POP UP WINDOW ---
+    # --- POP UP WINDOW ---
     if command -v gnome-terminal &> /dev/null; then
-        # 标题显示使用的 GPU ID
         env -u LD_LIBRARY_PATH -u PYTHONPATH gnome-terminal --title="GPU $ASSIGNED_GPU_ID : $JOB_NAME" --geometry=100x24 -- bash -c "tail -f \"$LOG_FILE\"" &
     elif command -v xterm &> /dev/null; then
         xterm -T "GPU $ASSIGNED_GPU_ID : $JOB_NAME" -e "tail -f \"$LOG_FILE\"" &
     fi
-    # --------------------------
 
     {
         echo "================= STARTING PIPELINE $(date) =================" 
@@ -99,13 +106,17 @@ run_pipeline() {
         if [[ -f "$IP/stitched.mp4" ]]; then
             echo "--- RUNNING YOLO TRACKER (GPU $ASSIGNED_GPU_ID) ---" 
 
-            # IMPORTANT: 这里传入了 --gpu_id 参数
-            # 请确保你的 TrackerYolov11.py 已经按照上一个回答修改以接受此参数
-            "$PYTHON_EXEC" -u src/TrackerYolov11.py \
-                --input_folder "$IP/stitched.mp4" \
+            # IMPORTANT: Explicitly export CUDA_VISIBLE_DEVICES to be safe
+            export CUDA_VISIBLE_DEVICES=$ASSIGNED_GPU_ID
+            
+            "$PYTHON_EXEC" -u src/TrackerYolov11_cluster.py \
+                --input_folder "$IP" \
                 --output_folder "$OP" \
                 --onnx_weight "$ONNX_WEIGHTS_PATH" \
-                --gpu_id "$ASSIGNED_GPU_ID"
+                --gpu_id 0 \
+                --batch_size 32
+
+            unset CUDA_VISIBLE_DEVICES
 
             if [ $? -ne 0 ]; then
                 echo "!!! ERROR: TRACKER FAILED ($OP) !!!" 
@@ -120,15 +131,12 @@ run_pipeline() {
         "$PYTHON_EXEC" -u src/plot_trials.py -o "$OP" 
         
         # ==== Compression ====
-        # 注意：ffmpeg 也可以指定 GPU，如果需要硬件加速编码，
-        # 可以添加 -gpu $ASSIGNED_GPU_ID (取决于 ffmpeg 版本)
         VIDEO_FILE=$(ls "$OP"/*.mp4 2>/dev/null | head -n 1)
         if [[ -n "$VIDEO_FILE" ]]; then
             echo "--- RUNNING COMPRESSION ---" 
             TEMP_FILE="$OP/__temp_compressed.mp4"
-            # h264_nvenc 默认通常使用 GPU 0，如果有多个显卡，
-            # 可以尝试添加 -gpu $ASSIGNED_GPU_ID 选项 (如果不报错的话)
-            ffmpeg -y -hide_banner -loglevel warning -i "$VIDEO_FILE" -vcodec h264_nvenc -qp 30 "$TEMP_FILE" 
+            # Attempt to use specific GPU for FFmpeg
+            ffmpeg -y -hide_banner -loglevel warning -gpu "$ASSIGNED_GPU_ID" -i "$VIDEO_FILE" -vcodec h264_nvenc -qp 30 "$TEMP_FILE" 
             if [[ -f "$TEMP_FILE" ]]; then
                 mv -f "$TEMP_FILE" "$VIDEO_FILE"
             fi
@@ -142,7 +150,8 @@ run_pipeline() {
 # =================MAIN MANAGER LOOP=================
 
 echo "Scanning $ROOT_DIR..."
-echo "Detected $NUM_GPUS GPUs. Jobs will be distributed across them."
+echo "Detected $NUM_GPUS GPUs."
+echo "Only using GPUs with VRAM usage < ${GPU_MEM_THRESHOLD}MiB."
 
 # Find directory pairs
 find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH; do
@@ -154,11 +163,10 @@ find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH;
     if [[ -d "$OP_PATH" ]]; then
         
         # === RESOURCE SCHEDULER LOOP ===
-        # 这个循环会一直运行，直到找到一个空闲的 GPU
         SELECTED_GPU=-1
         
         while true; do
-            # 1. Check CPU Safety (全局检查)
+            # 1. Check CPU Safety
             CURRENT_CPU=$(get_cpu_usage)
             if (( CURRENT_CPU >= MAX_CPU_LOAD )); then
                 echo -ne "System CPU Busy ($CURRENT_CPU%). Waiting...\r"
@@ -166,25 +174,32 @@ find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH;
                 continue
             fi
 
-            # 2. Check for free GPU Slot
-            # 我们遍历 GPU_PIDS 数组，检查里面的 PID 是否还活着
+            # 2. Check for AVAILABLE GPU
             for ((i=0; i<NUM_GPUS; i++)); do
+                # A. Check if WE (this script) are running a job there
                 PID_CHECK="${GPU_PIDS[$i]}"
+                if [[ -n "$PID_CHECK" ]] && kill -0 "$PID_CHECK" 2>/dev/null; then
+                    # We are running a job here, so skip this GPU
+                    continue
+                fi
+
+                # B. Check REAL Hardware usage (Are others using it?)
+                CURRENT_VRAM=$(get_gpu_memory_usage "$i")
                 
-                # 如果 PID 为空，或者 PID 对应的进程已经不存在了(任务跑完了)
-                if [[ -z "$PID_CHECK" ]] || ! kill -0 "$PID_CHECK" 2>/dev/null; then
+                if [[ "$CURRENT_VRAM" -lt "$GPU_MEM_THRESHOLD" ]]; then
                     SELECTED_GPU=$i
-                    break # 找到了空闲显卡，跳出 for 循环
+                    # Found a free one! Break the inner for-loop
+                    break 
                 fi
             done
 
             # 3. Decision
             if [[ "$SELECTED_GPU" -ne -1 ]]; then
-                # 找到了可用显卡，跳出 while 等待循环
+                # Found a valid GPU, break the while-waiting loop
                 break
             else
-                # 所有显卡都在忙
-                echo -ne "All $NUM_GPUS GPUs are busy. Waiting for a slot...\r"
+                # All GPUs are busy (either by us or someone else)
+                echo -ne "Waiting for a spare GPU (Scanning $NUM_GPUS devices)...   \r"
                 sleep 5
             fi
         done
@@ -194,15 +209,11 @@ find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH;
         # === LAUNCH JOB ===
         echo "Launching Job: $DIR_NAME on GPU $SELECTED_GPU..."
         
-        # 后台运行，并传入选中的 GPU ID
         run_pipeline "$IP_PATH" "$OP_PATH" "$SELECTED_GPU" &
-        
-        # 获取刚刚启动的后台进程 PID
         NEW_PID=$!
-        
-        # 将 PID 填入对应的 GPU 槽位，标记该显卡为"忙碌"
         GPU_PIDS[$SELECTED_GPU]=$NEW_PID
         
+        # Ramp up delay to allow VRAM usage to spike so the next loop detects it
         sleep "$RAMP_UP_DELAY"
         
     else
