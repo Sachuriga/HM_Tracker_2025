@@ -1,137 +1,173 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-:: ================= CONFIGURATION =================
-set "TRODES_BIN=C:\Users\gl_pc\Desktop\Track\trodes\trodesexport.exe"
-set "ONNX_WEIGHTS_PATH=C:\Users\gl_pc\Desktop\track\yolov3_training_best.onnx"
-set FREQ=30000
-:: =================================================
+:: ========================================================
+::               CONFIGURATION (SHARED)
+:: ========================================================
+cd /d "%~dp0"
 
-:: Check arguments
+:: Thresholds
+set MAX_CPU=90
+set MAX_GPU=90
+set WAIT_SECONDS=10
+
+:: Paths
+set "ONNX_WEIGHTS_PATH=C:\Users\gl_pc\Desktop\track\yolov3_training_best.onnx"
+set "TRODES_EXPORT_CMD=C:\Users\gl_pc\Desktop\track\trodes\trodesexport.exe"
+set FREQ=30000
+
+:: ========================================================
+::           MODE CHECK: MASTER OR WORKER?
+:: ========================================================
+if "%~1"==":WORKER" goto :WORKER_ROUTINE
+
+echo ========================================================
+echo          SMART PARALLEL DEBUG MODE (Resource Aware)
+echo ========================================================
+:: FIXED LINE BELOW: Added ^ before |
+echo [CONFIG] Max CPU: %MAX_CPU%%% ^| Max GPU: %MAX_GPU%%%
+echo.
+
+:: 3. Handle Input (Master Mode)
 if "%~1"=="" (
-    echo Usage: runner_direct.bat "C:\Users\gl_pc\Desktop\Track_2021"
+    echo Usage: runner_windows.bat "path_to_data_folder"
     exit /b 1
 )
 
-:: Clean path
-set "ROOT_DIR=%~1"
-if "!ROOT_DIR:~-1!"=="\" set "ROOT_DIR=!ROOT_DIR:~0,-1!"
+pushd "%~1"
+set "ROOT_DIR=%CD%"
+popd
+echo [DEBUG] Target Root Directory: [%ROOT_DIR%]
 
-echo Scanning: "%ROOT_DIR%"
+:: 4. Scan Loop (Master Mode)
+set count=0
 
-:: ================= MAIN LOOP =================
 for /d %%D in ("%ROOT_DIR%\ip*") do (
     set "IP_PATH=%%~fD"
     set "DIR_NAME=%%~nD"
     set "NUM=!DIR_NAME:ip=!"
-    set "OP_PATH=!ROOT_DIR!\op!NUM!"
+    set "OP_PATH=%ROOT_DIR%\op!NUM!"
 
-    :: Check if OP folder exists using pushd (safest method)
-    pushd "!OP_PATH!" 2>nul
-    if not errorlevel 1 (
-        popd
-        echo [MATCH] Found pair: !DIR_NAME! -^> op!NUM!
+    if exist "!OP_PATH!\" (
         
-        :: LAUNCH IMMEDIATELY (No CPU Check)
-        :: We use 'start' to open a new window.
-        start "Job: !DIR_NAME!" cmd /c "%~f0" :WORKER "!IP_PATH!" "!OP_PATH!"
+        echo.
+        echo [QUEUE] Preparing to launch: !DIR_NAME!
         
-        :: Wait 5 seconds to prevent opening 50 windows at once
-        timeout /t 5 /nobreak >nul
+        :: >>> RESOURCE CHECK BEFORE LAUNCH <<<
+        call :WAIT_FOR_RESOURCES
+        
+        set /a count+=1
+        echo [LAUNCH] System clear. Spawning worker for !DIR_NAME!
+        start "Job-!DIR_NAME!" cmd /k call "%~f0" :WORKER "!IP_PATH!" "!OP_PATH!"
+        
+        :: Small safety buffer to let the new process register its load
+        timeout /t 3 /nobreak >nul
         
     ) else (
-        echo [SKIP]  !DIR_NAME! (No matching '!OP_PATH!')
+        echo [SKIP] !OP_PATH! does not exist.
     )
 )
 
 echo.
-echo All jobs triggered.
+echo ========================================================
+echo [MASTER] Launched !count! jobs.
+echo ========================================================
 pause
-exit /b 0
+exit /b
 
-:: ================= WORKER PROCESS =================
-:WORKER
-if "%1"==":WORKER" (
-    set "IP=%~2"
-    set "OP=%~3"
-    set "LOG_FILE=%~3\pipeline_log.txt"
+:: ========================================================
+::            RESOURCE MONITOR SUBROUTINE
+:: ========================================================
+:WAIT_FOR_RESOURCES
+:CHECK_AGAIN
+    :: 1. GET CPU LOAD
+    set CPU_LOAD=0
+    for /f "skip=1" %%P in ('wmic cpu get loadpercentage') do (
+        if "%%P" neq "" set CPU_LOAD=%%P
+        goto :break_cpu
+    )
+    :break_cpu
+
+    :: 2. GET GPU LOAD (Requires nvidia-smi)
+    set GPU_LOAD=0
+    nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits > gpu_temp.txt 2>nul
+    if exist gpu_temp.txt (
+        set /p GPU_LOAD=<gpu_temp.txt
+        del gpu_temp.txt
+    )
     
-    if not exist "%~3" mkdir "%~3"
+    :: Handle case where GPU might return multiple lines or empty
+    if "%GPU_LOAD%"=="" set GPU_LOAD=0
 
-    :: Redirect all output to log, but also keep window open
-    (
-        echo ================= STARTING PIPELINE =================
-        echo Time: %DATE% %TIME%
-        echo Input: %IP%
-        echo Output: %OP%
-        echo.
-        
-        :: 1. CHECK PYTHON (Important for Conda)
-        python --version
-        if errorlevel 1 (
-            echo !!! ERROR: Python not found. Anaconda environment might not be active in this window.
-            goto :ErrorExit
-        )
+    :: 3. COMPARE
+    if !CPU_LOAD! GTR %MAX_CPU% (
+        echo    [WAIT] High CPU Load: !CPU_LOAD!%%. Pausing %WAIT_SECONDS%s...
+        timeout /t %WAIT_SECONDS% /nobreak >nul
+        goto :CHECK_AGAIN
+    )
 
-        :: 2. RUN TRODES
-        echo --- RUNNING TRODES ---
-        for /r "%IP%" %%f in (*.rec) do (
-            echo Processing: %%~nxf
-            "%TRODES_BIN%" -dio -rec "%%f"
-        )
+    if !GPU_LOAD! GTR %MAX_GPU% (
+        echo    [WAIT] High GPU Load: !GPU_LOAD!%%. Pausing %WAIT_SECONDS%s...
+        timeout /t %WAIT_SECONDS% /nobreak >nul
+        goto :CHECK_AGAIN
+    )
 
-        :: 3. RUN SYNC
-        echo --- RUNNING LED SYNC ---
-        python -u ./src/Video_LED_Sync_using_ICA.py -i "%IP%" -o "%OP%" -f %FREQ%
-        if errorlevel 1 goto :ErrorExit
+    echo    [CHECK] CPU: !CPU_LOAD!%% ^| GPU: !GPU_LOAD!%% - OK.
+exit /b
 
-        :: 4. RUN STITCHING
-        echo --- RUNNING STITCHING ---
-        python -u ./src/join_views.py "%IP%"
+:: ========================================================
+::               THE WORKER SUBROUTINE
+:: ========================================================
+:WORKER_ROUTINE
+set "IP=%~2"
+set "OP=%~3"
+color 0A 
 
-        :: 5. RUN TRACKER
-        if exist "%IP%\stitched.mp4" (
-            echo --- RUNNING YOLO TRACKER ---
-            python -u ./src/TrackerYolov.py --input_folder "%IP%\stitched.mp4" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
-            if errorlevel 1 goto :ErrorExit
-        ) else (
-            echo [Warning] stitched.mp4 not found. Skipping tracking.
-        )
+echo.
+echo ^> ^> ^> WORKER STARTED ^< ^< ^<
+echo [INFO] IP: %IP%
+echo [INFO] OP: %OP%
 
-        :: 6. PLOTTING
-        echo --- RUNNING PLOTTING ---
-        python -u plot_trials.py -o "%OP%"
-        if errorlevel 1 goto :ErrorExit
-
-        :: 7. COMPRESSION
-        for %%v in ("%OP%\*.mp4") do (
-            echo --- RUNNING COMPRESSION: %%~nxv ---
-            ffmpeg -y -hide_banner -loglevel warning -i "%%v" -vcodec libx264 -crf 28 "%OP%\__temp_compressed.mp4"
-            if exist "%OP%\__temp_compressed.mp4" (
-                move /y "%OP%\__temp_compressed.mp4" "%%v"
-            )
-            goto :CompDone
-        )
-        :CompDone
-
-        echo.
-        echo ================= FINISHED =================
-        echo You may close this window.
-        
-    ) >> "!LOG_FILE!" 2>&1
-
-    :: Display the log on the screen so you can see what happened
-    type "!LOG_FILE!"
-    pause
-    exit
-    
-    :ErrorExit
-    echo.
-    echo !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    echo !!!       JOB FAILED         !!!
-    echo !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    echo.
-    echo See log details above.
-    pause
-    exit
+REM 1. TRODES CHECK
+echo.
+echo [STEP 1] Running Trodes...
+if exist "%TRODES_EXPORT_CMD%" (
+    for %%F in ("%IP%\*.rec") do (
+        "%TRODES_EXPORT_CMD%" -dio -rec "%%F"
+    )
 )
+
+REM 2. SYNC CHECK
+echo.
+echo [STEP 2] Running Sync Script...
+if exist ".\src\Video_LED_Sync_using_ICA.py" (
+    python -u ./src/Video_LED_Sync_using_ICA.py -i "%IP%" -o "%OP%" -f %FREQ%
+)
+
+REM 3. STITCH CHECK
+echo.
+echo [STEP 3] Running Stitching...
+if exist ".\src\join_views.py" (
+    python -u ./src/join_views.py "%IP%"
+)
+
+REM 4. TRACKER CHECK
+echo.
+echo [STEP 4] Running Tracker...
+if exist "%IP%\stitched.mp4" (
+    if exist ".\src\TrackerYolov.py" (
+        python -u ./src/TrackerYolov.py --input_folder "%IP%\stitched.mp4" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
+    )
+)
+
+REM 5. PLOT CHECK
+echo.
+echo [STEP 5] Running Plotting...
+if exist "plot_trials.py" (
+    python -u plot_trials.py -o "%OP%"
+)
+
+echo.
+echo [COMPLETE] Worker finished.
+timeout /t 5
+exit
