@@ -80,13 +80,13 @@ class ThreadedVideoWriter:
 
 # --- CLASS: Tracker ---
 class Tracker:
-    def __init__(self, vp, nl, out, metadata):
+    def __init__(self, vp, nl, out, metadata, onnx_weight):
         '''Tracker class initialisations'''
         self.metadata = metadata 
         self.out_path = out 
-        
+        self.onnx_weight = onnx_weight
         threads = list()
-        cnn = threading.Thread(target=self.load_network, args=(1,))
+        cnn = threading.Thread(target=self.load_network(onnx_weights_path=self.onnx_weight), args=(1,))
         threads.append(cnn)
         session = threading.Thread(target=self.load_session, args=(vp, nl, 1, out))
         threads.append(session)
@@ -95,7 +95,7 @@ class Tracker:
         for thread in threads:
             thread.join()
             
-        print('\n -Network loaded- ', self.session)
+        print('\n -Network loaded- ', session)
 
         print("Caching node dictionary...")
         self.nodes_dict = mask.create_node_dict(self.node_list)
@@ -171,7 +171,7 @@ class Tracker:
             # We don't want to stop execution for this.
             pass
         
-    def load_network(self, n):
+    def load_network(self, onnx_weights_path):
         # Suppress ONNX warnings for cleaner batch logs
         so = onnxruntime.SessionOptions()
         so.log_severity_level = 3 # Error only
@@ -179,14 +179,16 @@ class Tracker:
         #onnx_weights_path = 'yolov3_training_best.onnx'
 
         self.network_size = (416, 416)
-        self.session = onnxruntime.InferenceSession(onnx_weights_path, sess_options=so,
+        self.session = onnxruntime.InferenceSession(self.onnx_weight, sess_options=so,
                                                     providers=['CUDAExecutionProvider', 'CPUExecutionProvider']) 
+        print("loaded network")
+        print(self.session)
         self.session.get_modelmeta()
         self.input_name = self.session.get_inputs()[0].name
         self.output_name_1 = self.session.get_outputs()[0].name
         self.output_name_2 = self.session.get_outputs()[1].name
         self.classes = []
-        with open("tools/classes.txt", "r") as f:
+        with open("src/tools/classes.txt", "r") as f:
             self.classes = f.read().splitlines()
 
     def load_session(self, vp, nl, n, out):
@@ -913,7 +915,7 @@ def parse_metadata_xlsx(xlsx_path):
 # --- MAIN ---
 if __name__ == "__main__":
     try:
-        node_list = Path('tools/node_list_new.csv').resolve()
+        node_list = Path('src/tools/node_list_new.csv').resolve()
         print('\n\nTracker version: v2.11 (Headless / Mass Analysis)\n\n')
 
         # Argument Parsing
@@ -926,8 +928,9 @@ if __name__ == "__main__":
         
         in_p = args.input_folder
         out_p = args.output_folder
-        onnx_weight = args.onnx_weight
-        
+        onnx_weight_path = args.onnx_weight
+        print("onnx path")
+        print(onnx_weight_path)
         # 1. Define Video Path
         vid_p = os.path.join(in_p, 'stitched.mp4')
         if not os.path.exists(vid_p):
@@ -944,7 +947,7 @@ if __name__ == "__main__":
         metadata = parse_metadata_xlsx(xlsx_file)
 
         # 3. Start Tracker
-        tracker = Tracker(vp=vid_p, nl=node_list, out=out_p, metadata=metadata)
+        tracker = Tracker(vp=vid_p, nl=node_list, out=out_p, metadata=metadata, onnx_weight=onnx_weight_path)
         
         # Optional renaming
         tracker.change_name_csv(out_p)
