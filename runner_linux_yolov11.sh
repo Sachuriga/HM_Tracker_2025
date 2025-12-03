@@ -2,14 +2,14 @@
 
 # =================CONFIGURATION=================
 ROOT_DIR="$1"
-MAX_CPU_LOAD=95
-MAX_GPU_LOAD=95
+# 注意：现在脚本主要由 GPU 数量限制并发，这 CPU 阈值作为二级保险
+MAX_CPU_LOAD=95 
 FREQ=20000
 
 ONNX_WEIGHTS_PATH="/home/genzel/Desktop/Documents/Param/yolov3_training_best.onnx"
 
 # Initial cooldown to allow a process to ramp up resources
-RAMP_UP_DELAY=10 
+RAMP_UP_DELAY=5
 # ===============================================
 
 # 1. Check if Root Directory is provided
@@ -17,6 +17,23 @@ if [[ -z "$ROOT_DIR" ]]; then
     echo "Usage: ./batch_runner.sh <path_to_data_folder>"
     exit 1
 fi
+
+# === NEW: DETECT GPUS ===
+# 获取系统中的 GPU 数量
+if command -v nvidia-smi &> /dev/null; then
+    NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    echo "Detected $NUM_GPUS NVIDIA GPU(s)."
+else
+    NUM_GPUS=0
+    echo "No NVIDIA GPUs detected. Logic will default to CPU or fail if GPU is required."
+fi
+
+# 初始化 GPU 状态数组，用来存储当前占用该 GPU 的进程 PID
+# GPU_PIDS[0] 存储占用 GPU 0 的任务 PID，以此类推
+declare -a GPU_PIDS
+for ((i=0; i<NUM_GPUS; i++)); do
+    GPU_PIDS[$i]=""
+done
 
 # ================= FUNCTIONS =================
 get_cpu_usage() {
@@ -30,44 +47,31 @@ get_cpu_usage() {
     fi
 }
 
-get_gpu_usage() {
-    if command -v nvidia-smi &> /dev/null; then
-        nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n 1
-    else
-        echo "0"
-    fi
-}
-
 # =================THE PIPELINE WORKER=================
 run_pipeline() {
     local IP="$1"
     local OP="$2"
+    local ASSIGNED_GPU_ID="$3"  # 接收分配的 GPU ID
     local JOB_NAME=$(basename "$IP")
     local LOG_FILE="$OP/pipeline_log.txt"
     
     mkdir -p "$OP"
     
     # Initialize the log file
-    echo ">>> PREPARING JOB: Pair $IP -> $OP" > "$LOG_FILE"
+    echo ">>> PREPARING JOB: Pair $IP -> $OP (On GPU: $ASSIGNED_GPU_ID)" > "$LOG_FILE"
 
-    # --- NEW: POP UP WINDOW (FIXED FOR CONDA) ---
-    # We use 'env -u LD_LIBRARY_PATH' to stop the Conda environment from crashing gnome-terminal
+    # --- NEW: POP UP WINDOW ---
     if command -v gnome-terminal &> /dev/null; then
-        # Opens GNOME terminal. 
-        # We strip LD_LIBRARY_PATH so it uses system libs, not Conda libs
-        env -u LD_LIBRARY_PATH -u PYTHONPATH gnome-terminal --title="Running: $JOB_NAME" --geometry=100x24 -- bash -c "tail -f \"$LOG_FILE\"" &
-    
+        # 标题显示使用的 GPU ID
+        env -u LD_LIBRARY_PATH -u PYTHONPATH gnome-terminal --title="GPU $ASSIGNED_GPU_ID : $JOB_NAME" --geometry=100x24 -- bash -c "tail -f \"$LOG_FILE\"" &
     elif command -v xterm &> /dev/null; then
-        # Fallback for xterm
-        xterm -T "Running: $JOB_NAME" -e "tail -f \"$LOG_FILE\"" &
-    else
-        echo "Warning: No terminal emulator found. Logs will strictly be in files."
+        xterm -T "GPU $ASSIGNED_GPU_ID : $JOB_NAME" -e "tail -f \"$LOG_FILE\"" &
     fi
     # --------------------------
 
-    # Redirect ALL output below this line to the log file
     {
         echo "================= STARTING PIPELINE $(date) =================" 
+        echo "=== ASSIGNED GPU ID: $ASSIGNED_GPU_ID ==="
 
         # === Extract DIO ===
         for i in $(find "$IP" -name "*.rec" -type f); do
@@ -79,10 +83,8 @@ run_pipeline() {
         echo "--- RUNNING LED SYNC ---" 
         python3 -u ./src/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" -f "$FREQ" 
         
-        # Check Sync Status
         if [ $? -ne 0 ]; then
             echo "!!! ERROR: LED SYNC FAILED ($OP) !!!" 
-            echo "Check log above for details."
             return 
         fi
 
@@ -92,12 +94,15 @@ run_pipeline() {
 
         # ==== Tracking ====
         if [[ -f "$IP/stitched.mp4" ]]; then
-            echo "--- RUNNING YOLO TRACKER ---" 
+            echo "--- RUNNING YOLO TRACKER (GPU $ASSIGNED_GPU_ID) ---" 
 
+            # IMPORTANT: 这里传入了 --gpu_id 参数
+            # 请确保你的 TrackerYolov11.py 已经按照上一个回答修改以接受此参数
             python3 -u ./src/TrackerYolov11.py \
                 --input_folder "$IP/stitched.mp4" \
                 --output_folder "$OP" \
-                --onnx_weight "$ONNX_WEIGHTS_PATH" 
+                --onnx_weight "$ONNX_WEIGHTS_PATH" \
+                --gpu_id "$ASSIGNED_GPU_ID"
 
             if [ $? -ne 0 ]; then
                 echo "!!! ERROR: TRACKER FAILED ($OP) !!!" 
@@ -111,16 +116,15 @@ run_pipeline() {
         echo "--- RUNNING PLOTTING ---" 
         python3 -u plot_trials.py -o "$OP" 
         
-        if [ $? -ne 0 ]; then
-            echo "!!! ERROR: PLOTTING FAILED ($OP) !!!" 
-            return
-        fi
-
         # ==== Compression ====
+        # 注意：ffmpeg 也可以指定 GPU，如果需要硬件加速编码，
+        # 可以添加 -gpu $ASSIGNED_GPU_ID (取决于 ffmpeg 版本)
         VIDEO_FILE=$(ls "$OP"/*.mp4 2>/dev/null | head -n 1)
         if [[ -n "$VIDEO_FILE" ]]; then
             echo "--- RUNNING COMPRESSION ---" 
             TEMP_FILE="$OP/__temp_compressed.mp4"
+            # h264_nvenc 默认通常使用 GPU 0，如果有多个显卡，
+            # 可以尝试添加 -gpu $ASSIGNED_GPU_ID 选项 (如果不报错的话)
             ffmpeg -y -hide_banner -loglevel warning -i "$VIDEO_FILE" -vcodec h264_nvenc -qp 30 "$TEMP_FILE" 
             if [[ -f "$TEMP_FILE" ]]; then
                 mv -f "$TEMP_FILE" "$VIDEO_FILE"
@@ -128,15 +132,14 @@ run_pipeline() {
         fi
 
         echo "================= FINISHED $(date) =================" 
-        echo " You may close this window now."
 
     } >> "$LOG_FILE" 2>&1
 }
 
 # =================MAIN MANAGER LOOP=================
 
-echo "Scanning $ROOT_DIR for ip/op pairs..."
-echo "Main Monitor Running (Job details will appear in pop-up windows)..."
+echo "Scanning $ROOT_DIR..."
+echo "Detected $NUM_GPUS GPUs. Jobs will be distributed across them."
 
 # Find directory pairs
 find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH; do
@@ -147,31 +150,55 @@ find "$ROOT_DIR" -maxdepth 1 -type d -name "ip*" | sort | while read -r IP_PATH;
 
     if [[ -d "$OP_PATH" ]]; then
         
-        # === PRE-LAUNCH RESOURCE CHECK LOOP ===
+        # === RESOURCE SCHEDULER LOOP ===
+        # 这个循环会一直运行，直到找到一个空闲的 GPU
+        SELECTED_GPU=-1
+        
         while true; do
+            # 1. Check CPU Safety (全局检查)
             CURRENT_CPU=$(get_cpu_usage)
-            CURRENT_GPU=$(get_gpu_usage)
-            JOBS_RUNNING=$(jobs -r | wc -l)
+            if (( CURRENT_CPU >= MAX_CPU_LOAD )); then
+                echo -ne "System CPU Busy ($CURRENT_CPU%). Waiting...\r"
+                sleep 5
+                continue
+            fi
 
-            # Print status to main terminal
-            echo -ne "System Status: CPU ${CURRENT_CPU}% | GPU ${CURRENT_GPU}% | Jobs Active: ${JOBS_RUNNING}\r"
-            
-            if (( CURRENT_CPU < MAX_CPU_LOAD )) && (( CURRENT_GPU < MAX_GPU_LOAD )); then
-                echo "" # New line to clear the carriage return
+            # 2. Check for free GPU Slot
+            # 我们遍历 GPU_PIDS 数组，检查里面的 PID 是否还活着
+            for ((i=0; i<NUM_GPUS; i++)); do
+                PID_CHECK="${GPU_PIDS[$i]}"
+                
+                # 如果 PID 为空，或者 PID 对应的进程已经不存在了(任务跑完了)
+                if [[ -z "$PID_CHECK" ]] || ! kill -0 "$PID_CHECK" 2>/dev/null; then
+                    SELECTED_GPU=$i
+                    break # 找到了空闲显卡，跳出 for 循环
+                fi
+            done
+
+            # 3. Decision
+            if [[ "$SELECTED_GPU" -ne -1 ]]; then
+                # 找到了可用显卡，跳出 while 等待循环
                 break
             else
-                # If busy, wait
-                if [[ "$JOBS_RUNNING" -gt 0 ]]; then
-                    wait -n
-                else
-                    sleep 10
-                fi
+                # 所有显卡都在忙
+                echo -ne "All $NUM_GPUS GPUs are busy. Waiting for a slot...\r"
+                sleep 5
             fi
         done
 
+        echo "" # Clear line
+
         # === LAUNCH JOB ===
-        echo "Launching Job: $DIR_NAME..."
-        run_pipeline "$IP_PATH" "$OP_PATH" &
+        echo "Launching Job: $DIR_NAME on GPU $SELECTED_GPU..."
+        
+        # 后台运行，并传入选中的 GPU ID
+        run_pipeline "$IP_PATH" "$OP_PATH" "$SELECTED_GPU" &
+        
+        # 获取刚刚启动的后台进程 PID
+        NEW_PID=$!
+        
+        # 将 PID 填入对应的 GPU 槽位，标记该显卡为"忙碌"
+        GPU_PIDS[$SELECTED_GPU]=$NEW_PID
         
         sleep "$RAMP_UP_DELAY"
         
