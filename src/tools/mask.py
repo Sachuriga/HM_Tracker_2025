@@ -109,5 +109,5 @@ def create_mask(node_list):
     #return res2
 
 from pathlib import Path 
-node_list = Path('tools/node_list_new.csv').resolve()
+node_list = Path('src/tools/node_list_new.csv').resolve()
 create_mask(node_list)

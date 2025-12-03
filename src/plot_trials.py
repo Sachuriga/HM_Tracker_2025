@@ -364,7 +364,7 @@ if __name__ == "__main__":
     SMOOTH_SAMPLES_50 = max(1, int(round(5.0 * FS))) 
 
     # --- Load Node List and Build Graph ---
-    node_file_path = Path("node_list_new.csv")
+    node_file_path = Path("src/tools/node_list_new.csv")
     nodes_data = None
     maze_graph = None
 

@@ -156,7 +156,7 @@ echo.
 echo [STEP 4] Running Tracker...
 if exist "%IP%\stitched.mp4" (
     if exist ".\src\TrackerYolov.py" (
-        python -u ./src/TrackerYolov.py --input_folder "%IP%\stitched.mp4" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
+        python -u ./src/TrackerYolov.py --input_folder "%IP%" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
     )
 )
 
@@ -164,7 +164,39 @@ REM 5. PLOT CHECK
 echo.
 echo [STEP 5] Running Plotting...
 if exist "plot_trials.py" (
-    python -u plot_trials.py -o "%OP%"
+    python -u ./src/plot_trials.py -o "%OP%"
+)
+
+REM 6. COMPRESS CHECK (AUTOMATED)
+echo.
+echo [STEP 6] Running Compression...
+set "VIDEO_FILE="
+
+REM Look for the first MP4 file in the output directory
+for %%f in ("%OP%\*.mp4") do (
+    set "VIDEO_FILE=%%~f"
+    goto :FOUND_VIDEO
+)
+
+:FOUND_VIDEO
+if "!VIDEO_FILE!"=="" (
+    echo [INFO] No MP4 video found in "%OP%". Skipping compression.
+) else (
+    echo [INFO] Found video: "!VIDEO_FILE!"
+    echo [INFO] Compressing (CRF 28) and overwriting original...
+
+    set "TEMP_FILE=%OP%\__temp_compressed.mp4"
+
+    REM ffmpeg -y (overwrite output) -i input ... output
+    ffmpeg -y -v error -i "!VIDEO_FILE!" -vcodec libx264 -crf 28 "!TEMP_FILE!"
+
+    if exist "!TEMP_FILE!" (
+        REM Overwrite original with compressed version
+        move /Y "!TEMP_FILE!" "!VIDEO_FILE!" >nul
+        echo [SUCCESS] Video compressed and overwritten.
+    ) else (
+        echo [ERROR] ffmpeg failed to create output file.
+    )
 )
 
 echo.
