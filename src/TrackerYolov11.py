@@ -167,11 +167,20 @@ class Tracker:
         
     def load_network(self, model_path):
         # --- MODIFIED FOR YOLO11 ---
+        import torch # Import torch to check device
+        
         print(f"Loading YOLO11 model from: {model_path}")
         try:
             self.model = YOLO(model_path)
-            # Optional: Fuse model for faster inference
-            # self.model.fuse() 
+            
+            # CHECK DEVICE STATUS
+            if torch.cuda.is_available():
+                print(f" >> SUCCESS: GPU Detected: {torch.cuda.get_device_name(0)}")
+                self.device = 0 # Set device to GPU ID 0
+            else:
+                print(" >> WARNING: No GPU detected. Running on CPU.")
+                self.device = 'cpu'
+
             print("YOLO11 Model loaded successfully.")
             print(f"Classes found: {self.model.names}")
         except Exception as e:
@@ -423,7 +432,7 @@ class Tracker:
     def cnn(self, frame):
         # 1. Inference with Ultralytics
         # conf=0.3, iou=0.8 matches your original NMS settings (0.8 NMS, 0.3 Conf in your previous code)
-        results = self.model(frame, verbose=False, conf=0.3, iou=0.8)[0]
+        results = self.model(frame, verbose=False, conf=0.3, iou=0.8, device=self.device)[0]
         
         self.Rat = None
         self.Researcher = None

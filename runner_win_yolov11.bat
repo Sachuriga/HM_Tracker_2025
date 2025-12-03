@@ -156,7 +156,7 @@ echo.
 echo [STEP 4] Running Tracker...
 if exist "%IP%\stitched.mp4" (
     if exist ".\src\TrackerYolov.py" (
-        python -u ./src/TrackerYolov.py --input_folder "%IP%" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
+        python -u ./src/TrackerYolov11.py --input_folder "%IP%" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
     )
 )
 
