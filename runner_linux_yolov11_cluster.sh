@@ -3,7 +3,7 @@
 # =================CONFIGURATION=================
 ROOT_DIR="$1"
 MAX_CPU_LOAD=95 
-FREQ=20000
+FREQ=30000
 PYTHON_EXEC="/home/sachuriga/yolov12x/bin/python3"
 ONNX_WEIGHTS_PATH="/home//sachuriga/data/yolov_models/rat_yolov12_drive_run7/weights/best.pt"
 
@@ -113,7 +113,7 @@ run_pipeline() {
                 --input_folder "$IP" \
                 --output_folder "$OP" \
                 --onnx_weight "$ONNX_WEIGHTS_PATH" \
-                --gpu_id 0 \
+                --gpu_id “$ASSIGNED_GPU_ID” \
                 --batch_size 32
 
             unset CUDA_VISIBLE_DEVICES

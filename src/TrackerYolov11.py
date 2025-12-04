@@ -432,7 +432,7 @@ class Tracker:
     def cnn(self, frame):
         # 1. Inference with Ultralytics
         # conf=0.3, iou=0.8 matches your original NMS settings (0.8 NMS, 0.3 Conf in your previous code)
-        results = self.model(frame, verbose=False, conf=0.3, iou=0.8, device=self.device)[0]
+        results = self.model(frame, verbose=False, conf=0.3, iou=0.9, device=self.device)[0]
         
         self.Rat = None
         self.Researcher = None
