@@ -275,7 +275,14 @@ class Tracker:
         self.researcher_goal_timer = 0.0
 
     def run_vid(self):
-        print('\nStarting video processing (Headless Mode).....\n')
+        print('\nStarting video processing (Live Stream Enabled).....\n')
+        
+        # --- GUI SETUP ---
+        window_name = f"Tracker - Rat {self.rat}"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL) 
+        cv2.resizeWindow(window_name, 1176, 712) # 设置一个合理的初始大小
+        # -----------------
+
         if self.start_point is None:
             with open(self.save, 'a+') as file:
                 file.write(f"Rat number: {self.rat} , Date: {self.date} \n")
@@ -312,7 +319,19 @@ class Tracker:
             self.cnn(self.disp_frame) 
             self.annotate_frame(self.disp_frame)
             
+            # Write to video file
             self.out.write(self.disp_frame)
+            
+            # --- SHOW VIDEO WINDOW (STREAM) ---
+            cv2.imshow(window_name, self.disp_frame)
+            
+            # Wait 1ms for key press. If 'q' is pressed, stop the loop.
+            # waitKey is REQUIRED for imshow to redraw the window.
+            k = cv2.waitKey(1) & 0xFF
+            if k == ord('q'):
+                print("\nUser interrupted execution via Window (Pressed 'q').")
+                break
+            # ----------------------------------
             
             rat_x = self.pos_centroid[0] if self.pos_centroid else np.nan
             rat_y = self.pos_centroid[1] if self.pos_centroid else np.nan
@@ -361,8 +380,13 @@ class Tracker:
         hours, rem = divmod(end - self.Start_Time, 3600)
         minutes, seconds = divmod(rem, 60)
         print("\nTracking process finished in: {:0>2}:{:0>2}:{:05.2f}".format(int(hours), int(minutes), seconds))
+        
         self.cap.release()
         self.out.release() 
+        
+        # --- CLEANUP GUI ---
+        cv2.destroyAllWindows()
+        # -------------------
 
     def export_tracking_data(self):
         print("\n>> Compiling tracking data to CSV...")
@@ -447,7 +471,6 @@ class Tracker:
         return False
     
     # --- MODIFIED CNN FUNCTION FOR YOLO11 ---
-    # --- MODIFIED CNN FUNCTION FOR SAHI (TILING) ---
     def cnn(self, frame):
         # 1. 使用 SAHI 进行切片推理
         # slice_height/width: 建议设置为你训练时的切片大小 (比如 640 或 512)
