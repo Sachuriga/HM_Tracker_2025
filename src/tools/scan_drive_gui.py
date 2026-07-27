@@ -42,12 +42,12 @@ from pathlib import Path
 import pandas as pd
 
 from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QBrush, QFont, QPixmap
+from PyQt6.QtGui import QColor, QBrush, QFont, QPixmap, QAction
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QGroupBox, QFileDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QComboBox, QDialog, QCheckBox,
-    QSpinBox, QProgressBar, QScrollArea,
+    QSpinBox, QProgressBar, QScrollArea, QListWidget, QWidgetAction,
 )
 
 # Reuse the drive-scanning helpers from the sibling module.
