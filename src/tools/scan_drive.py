@@ -267,9 +267,30 @@ def _is_float(s):
 # ------------------------------------------------------------
 #                       drive scanning
 # ------------------------------------------------------------
+def _find_rat_container(root, max_depth=4):
+    """First directory at/under `root` (breadth-first, capped depth, skipping system
+    folders) that DIRECTLY holds one or more Rat<N>_* subfolders — so a bare drive
+    root (F:\\) auto-locates the HM_neurons folder inside it. None if not found."""
+    frontier = [(Path(root), 0)]
+    while frontier:
+        d, depth = frontier.pop(0)
+        try:
+            kids = [c for c in d.iterdir() if c.is_dir()]
+        except OSError:
+            continue
+        if any(_rat_of(c.name) is not None for c in kids):
+            return d
+        if depth < max_depth:
+            frontier.extend((c, depth + 1) for c in kids if not skip_dir(c.name))
+    return None
+
+
 def find_sessions(root):
     """Session-date folders (<YYYYMMDD>) under `root`, whether root is the drive
-    root (root/Rat*/date), a single Rat folder (root/date), or a date folder."""
+    root (root/Rat*/date), a single Rat folder (root/date), or a date folder. If
+    none are found directly (e.g. root is a bare drive with the data in root/
+    HM_neurons/Rat*/date), auto-locate the folder holding the Rat<N>_* dirs and
+    scan from there."""
     if _DATE_RE.match(root.name):
         return [root]
     out = []
@@ -285,6 +306,12 @@ def find_sessions(root):
                         out.append(g)
     except OSError:
         pass
+    if out:
+        return out
+    # nothing directly under root — bare drive? locate the HM_neurons / Rat container.
+    base = _find_rat_container(root)
+    if base is not None and base != Path(root):
+        return find_sessions(base)
     return out
 
 
