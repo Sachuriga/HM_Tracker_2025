@@ -1815,103 +1815,119 @@ class ScanDriveGUI(QMainWindow):
         row.addWidget(load)
         v.addLayout(row)
 
-        # --- 4 drive pickers ----------------------------------------------
-        box = QGroupBox("Drive folders (data is spread across up to 4 drives)")
-        grid = QGridLayout(box)
-        self.drive_edits: list[QLineEdit] = []
-        for i in range(4):
-            e = QLineEdit()
-            e.setPlaceholderText(f"drive root {i + 1} — contains Rat<N>_*/<YYYYMMDD>/ …")
-            btn = QPushButton("Browse…")
-            btn.clicked.connect(lambda _, k=i: self._pick_drive(k))
-            grid.addWidget(QLabel(f"Drive {i + 1}:"), i, 0)
-            grid.addWidget(e, i, 1)
-            grid.addWidget(btn, i, 2)
-            self.drive_edits.append(e)
+        # --- drive folders: an add/remove list (0..N) ---------------------
+        box = QGroupBox("Drive folders — each directly contains the Rat<N>_* folders "
+                        "(e.g. F:\\HM_neurons)")
+        bl = QVBoxLayout(box)
+        self.drive_list = QListWidget()
+        self.drive_list.setMaximumHeight(90)
+        self.drive_list.setToolTip("Add every drive/folder the data spans. Each should be one "
+                                   "level above the Rat<N>_* folders.")
+        bl.addWidget(self.drive_list)
+        drow = QHBoxLayout()
+        add_btn = QPushButton("Add folder…")
+        add_btn.clicked.connect(self._add_drive)
+        rem_btn = QPushButton("Remove")
+        rem_btn.clicked.connect(self._remove_drive)
+        drow.addWidget(add_btn)
+        drow.addWidget(rem_btn)
+        drow.addStretch(1)
+        bl.addLayout(drow)
         v.addWidget(box)
 
-        # --- actions ------------------------------------------------------
+        # --- menu bar: the occasional / maintenance actions tucked away ---
+        mb = self.menuBar()
+        m_file = mb.addMenu("&File")
+        a_open = QAction("Open spreadsheet…", self)
+        a_open.triggered.connect(self._pick_excel)
+        m_file.addAction(a_open)
+        m_file.addSeparator()
+        a_quit = QAction("Quit", self)
+        a_quit.triggered.connect(self.close)
+        m_file.addAction(a_quit)
+
+        m_fix = mb.addMenu("Fix / &Prepare")
+        self.organize_btn = QAction("Organize into folder…", self)
+        self.organize_btn.setToolTip("Assemble every roster session into one tree under a "
+                                     "folder you pick (move within a drive, copy across); "
+                                     "shows the full plan before writing anything.")
+        self.organize_btn.triggered.connect(self._organize)
+        self.organize_btn.setEnabled(False)
+        m_fix.addAction(self.organize_btn)
+        self.reset_btn = QAction("Reset → raw…", self)
+        self.reset_btn.setToolTip("Undo all filing: move every camera folder into a flat raw\\ "
+                                  "folder on its own drive; shows the plan before moving.")
+        self.reset_btn.triggered.connect(self._reset)
+        m_fix.addAction(self.reset_btn)
+        self.fixnames_btn = QAction("Fix video names…", self)
+        self.fixnames_btn.setToolTip("Rename camera videos whose name parts are out of order "
+                                     "to eye<NN>_<date>_<time>.mp4; shows the plan first.")
+        self.fixnames_btn.triggered.connect(self._fix_names)
+        m_fix.addAction(self.fixnames_btn)
+        m_fix.addSeparator()
+        self.meta_btn = QAction("Prepare RecordingMeta…", self)
+        self.meta_btn.setToolTip("Build a RecordingMeta.xlsx for every maze session from the "
+                                 "sheet; existing files are never overwritten.")
+        self.meta_btn.triggered.connect(self._prepare_meta)
+        self.meta_btn.setEnabled(False)
+        m_fix.addAction(self.meta_btn)
+
+        m_rep = mb.addMenu("&Reports")
+        self.summary_btn = QAction("Summary figure…", self)
+        self.summary_btn.setToolTip("One-look status figure per rat/repeat: pre/task/post/video "
+                                    "presence, size, and location. Searches all drives first.")
+        self.summary_btn.triggered.connect(self._summary)
+        self.summary_btn.setEnabled(False)
+        m_rep.addAction(self.summary_btn)
+        self.preproc_btn = QAction("Preprocess progress…", self)
+        self.preproc_btn.setToolTip("Per-session pipeline-step status from the "
+                                    "HM_neuron_preprocess tree.")
+        self.preproc_btn.triggered.connect(self._preprocess)
+        self.preproc_btn.setEnabled(False)
+        m_rep.addAction(self.preproc_btn)
+
+        m_opt = mb.addMenu("&Options")
+        self.act_meta_after = QAction("Prepare RecordingMeta after scan", self)
+        self.act_meta_after.setCheckable(True)
+        self.act_meta_after.setChecked(True)
+        self.act_meta_after.setToolTip("After each scan, write RecordingMeta.xlsx into any maze "
+                                       "session that lacks one (never overwrites existing files).")
+        m_opt.addAction(self.act_meta_after)
+        self.act_sysdrive = QAction("Include system drive (C:)", self)
+        self.act_sysdrive.setCheckable(True)
+        self.act_sysdrive.setToolTip("Also search C:\\ in the deep searches (slow — raw data "
+                                     "rarely lives there).")
+        m_opt.addAction(self.act_sysdrive)
+        m_opt.addSeparator()
+        self.depth_spin = QSpinBox()
+        self.depth_spin.setRange(1, 12)
+        self.depth_spin.setValue(6)
+        dw = QWidget()
+        dwl = QHBoxLayout(dw)
+        dwl.setContentsMargins(20, 2, 12, 2)
+        dwl.addWidget(QLabel("Search depth:"))
+        dwl.addWidget(self.depth_spin)
+        dwa = QWidgetAction(m_opt)
+        dwa.setDefaultWidget(dw)
+        m_opt.addAction(dwa)
+
+        # --- toolbar: just the daily actions ------------------------------
         act = QHBoxLayout()
         self.scan_btn = QPushButton("Scan drives")
         self.scan_btn.clicked.connect(self._scan)
         self.scan_btn.setEnabled(False)
         act.addWidget(self.scan_btn)
+        self.search_btn = QPushButton("Find scattered data…")
+        self.search_btn.setToolTip(
+            "Search every mounted drive (at any depth) for Rat<N>/<YYYYMMDD> folders, "
+            "to locate sessions that aren't under the drive folders above.")
+        self.search_btn.clicked.connect(self._search_all)
+        self.search_btn.setEnabled(False)
+        act.addWidget(self.search_btn)
         self.export_btn = QPushButton("Export CSV…")
         self.export_btn.clicked.connect(self._export)
         self.export_btn.setEnabled(False)
         act.addWidget(self.export_btn)
-
-        self.search_btn = QPushButton("Find scattered data…")
-        self.search_btn.setToolTip(
-            "Search every mounted drive (at any depth) for Rat<N>/<YYYYMMDD> folders, "
-            "to locate sessions that aren't under the roots selected above.")
-        self.search_btn.clicked.connect(self._search_all)
-        self.search_btn.setEnabled(False)
-        act.addWidget(self.search_btn)
-
-        self.organize_btn = QPushButton("Organize into folder…")
-        self.organize_btn.setToolTip(
-            "Assemble every roster session into one tree under a folder you pick.\n"
-            "Within a drive entries are moved by rename; across drives they are\n"
-            "copied and the source kept. Shows the full plan before writing anything.")
-        self.organize_btn.clicked.connect(self._organize)
-        self.organize_btn.setEnabled(False)
-        act.addWidget(self.organize_btn)
-
-        self.reset_btn = QPushButton("Reset → raw…")
-        self.reset_btn.setToolTip(
-            "Undo all filing: MOVE every camera folder — both already under Rat<N>/<date>\n"
-            "and loose — into a flat raw\\ folder on its own drive, so matching can be redone\n"
-            "from scratch. Same-drive rename; shows the full plan before moving anything.")
-        self.reset_btn.clicked.connect(self._reset)
-        act.addWidget(self.reset_btn)
-
-        self.fixnames_btn = QPushButton("Fix video names…")
-        self.fixnames_btn.setToolTip(
-            "Find camera videos whose name has the parts out of order (e.g.\n"
-            "2019-05-27_13-45-32_eye01.mp4) and rename them to the standard\n"
-            "eye<NN>_<date>_<time>.mp4 so scanning and matching can see them.\n"
-            "Renames in place; shows the full old→new plan before changing anything.")
-        self.fixnames_btn.clicked.connect(self._fix_names)
-        act.addWidget(self.fixnames_btn)
-
-        self.summary_btn = QPushButton("Summary figure…")
-        self.summary_btn.setToolTip(
-            "Draw a one-look status figure: per rat, grouped by repeat, every session\n"
-            "and whether pre/task/post/video are present, the right size, and where\n"
-            "they are. Searches all drives first.")
-        self.summary_btn.clicked.connect(self._summary)
-        self.summary_btn.setEnabled(False)
-        act.addWidget(self.summary_btn)
-
-        self.meta_btn = QPushButton("Prepare RecordingMeta…")
-        self.meta_btn.setToolTip(
-            "For every maze session, build a RecordingMeta.xlsx from the experiment\n"
-            "sheet (trials, start/goal nodes, trial types) and drop it in the video\n"
-            "folder. Existing RecordingMeta.xlsx files are never overwritten.")
-        self.meta_btn.clicked.connect(self._prepare_meta)
-        self.meta_btn.setEnabled(False)
-        act.addWidget(self.meta_btn)
-
-        self.preproc_btn = QPushButton("Preprocess progress…")
-        self.preproc_btn.setToolTip(
-            "Read the HM_neuron_preprocess tree and show, per session, which pipeline\n"
-            "steps have run (implanted 1e2345678d, non-implanted 23456d), by the output\n"
-            "files each step leaves behind.")
-        self.preproc_btn.clicked.connect(self._preprocess)
-        self.preproc_btn.setEnabled(False)
-        act.addWidget(self.preproc_btn)
-
-        act.addWidget(QLabel("depth:"))
-        self.depth_spin = QSpinBox()
-        self.depth_spin.setRange(1, 12)
-        self.depth_spin.setValue(6)
-        self.depth_spin.setToolTip("How many folder levels down to search on each drive.")
-        act.addWidget(self.depth_spin)
-        self.sysdrive_chk = QCheckBox("incl. system drive")
-        self.sysdrive_chk.setToolTip("Also search C:\\ (slow — raw data rarely lives there).")
-        act.addWidget(self.sysdrive_chk)
-
         act.addStretch(1)
         self.status_lbl = QLabel("Load a spreadsheet to begin.")
         act.addWidget(self.status_lbl)
@@ -1958,10 +1974,20 @@ class ScanDriveGUI(QMainWindow):
         elif cur in names:
             self.sheet_combo.setCurrentText(cur)
 
-    def _pick_drive(self, k: int):
-        d = QFileDialog.getExistingDirectory(self, f"Select drive root {k + 1}", str(Path.home()))
-        if d:
-            self.drive_edits[k].setText(d)
+    def _add_drive(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Add a drive folder (one level above the Rat<N>_* folders)", str(Path.home()))
+        if d and d not in self._drive_paths():
+            self.drive_list.addItem(d)
+
+    def _remove_drive(self):
+        for it in self.drive_list.selectedItems():
+            self.drive_list.takeItem(self.drive_list.row(it))
+
+    def _drive_paths(self) -> list:
+        return [self.drive_list.item(i).text().strip()
+                for i in range(self.drive_list.count())
+                if self.drive_list.item(i).text().strip()]
 
     # -- roster ------------------------------------------------------------
     def _load_roster(self):
@@ -2002,7 +2028,7 @@ class ScanDriveGUI(QMainWindow):
     def _scan(self):
         if not self.roster:
             return
-        roots = [e.text().strip() for e in self.drive_edits]
+        roots = self._drive_paths()
         if not any(roots):
             QMessageBox.warning(self, "No drives", "Select at least one drive folder.")
             return
@@ -2069,6 +2095,11 @@ class ScanDriveGUI(QMainWindow):
                                 f"(of {len(self.results)}).")
         self.scan_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
+        # Chain into writing any missing RecordingMeta.xlsx (safe: plan_meta never
+        # overwrites), so meta files are prepared as part of scanning. Off = uncheck
+        # Options ▸ "Prepare RecordingMeta after scan".
+        if self.roster and self.act_meta_after.isChecked():
+            self._prepare_meta(auto=True)
 
     def _scan_failed(self, msg: str):
         QMessageBox.critical(self, "Scan failed", msg)
@@ -2079,7 +2110,7 @@ class ScanDriveGUI(QMainWindow):
     def _search_all(self):
         if not self.roster:
             return
-        vols = sd.list_drive_roots(include_system=self.sysdrive_chk.isChecked())
+        vols = sd.list_drive_roots(include_system=self.act_sysdrive.isChecked())
         if not vols:
             QMessageBox.warning(self, "No drives", "No mounted volumes to search.")
             return
@@ -2094,12 +2125,12 @@ class ScanDriveGUI(QMainWindow):
         self.search_btn.setEnabled(False)
         self.scan_btn.setEnabled(False)
         self.status_lbl.setText("Searching all drives…")
-        roots = [e.text().strip() for e in self.drive_edits]
+        roots = self._drive_paths()
 
         self.search_thread = QThread()
         self.search_worker = SearchWorker(self.roster, roots,
                                           self.depth_spin.value(),
-                                          self.sysdrive_chk.isChecked())
+                                          self.act_sysdrive.isChecked())
         self.search_worker.moveToThread(self.search_thread)
         self.search_thread.started.connect(self.search_worker.run)
         self.search_worker.progress.connect(
@@ -2135,8 +2166,7 @@ class ScanDriveGUI(QMainWindow):
             return
         # Default the picker to the first selected drive root (usually the main
         # HM_neurons archive), since that is where data is consolidated.
-        start = next((e.text().strip() for e in self.drive_edits if e.text().strip()),
-                     str(Path.home()))
+        start = (self._drive_paths() or [str(Path.home())])[0]
         picked = QFileDialog.getExistingDirectory(
             self, "Organize into which drive/folder? (data goes into its HM_neurons archive)",
             start)
@@ -2154,12 +2184,12 @@ class ScanDriveGUI(QMainWindow):
         # from a stale picture is how data goes missing.
         self.status_lbl.setText("Looking at the drives…")
         self.organize_btn.setEnabled(False)
-        roots = [e.text().strip() for e in self.drive_edits]
+        roots = self._drive_paths()
 
         self.search_thread = QThread()
         self.search_worker = SearchWorker(self.roster, roots,
                                           self.depth_spin.value(),
-                                          self.sysdrive_chk.isChecked())
+                                          self.act_sysdrive.isChecked())
         self.search_worker.moveToThread(self.search_thread)
         self.search_thread.started.connect(self.search_worker.run)
         self.search_worker.progress.connect(
@@ -2205,10 +2235,10 @@ class ScanDriveGUI(QMainWindow):
 
     # -- reset: un-file all videos to per-drive raw/ -----------------------
     def _reset(self):
-        roots = [e.text().strip() for e in self.drive_edits if e.text().strip()]
+        roots = self._drive_paths()
         if not roots:                      # nothing picked — sweep every mounted volume
             roots = [str(r) for r in sd.list_drive_roots(
-                include_system=self.sysdrive_chk.isChecked())]
+                include_system=self.act_sysdrive.isChecked())]
         if not roots:
             QMessageBox.information(self, "Reset", "No drives to scan.")
             return
@@ -2252,10 +2282,10 @@ class ScanDriveGUI(QMainWindow):
 
     # -- fix misordered video file names -----------------------------------
     def _fix_names(self):
-        roots = [e.text().strip() for e in self.drive_edits if e.text().strip()]
+        roots = self._drive_paths()
         if not roots:
             roots = [str(r) for r in sd.list_drive_roots(
-                include_system=self.sysdrive_chk.isChecked())]
+                include_system=self.act_sysdrive.isChecked())]
         if not roots:
             QMessageBox.information(self, "Fix video names", "No drives to scan.")
             return
@@ -2296,11 +2326,11 @@ class ScanDriveGUI(QMainWindow):
             return
         self.summary_btn.setEnabled(False)
         self.status_lbl.setText("Searching all drives for the summary…")
-        roots = [e.text().strip() for e in self.drive_edits]
+        roots = self._drive_paths()
         self.search_thread = QThread()
         self.search_worker = SearchWorker(self.roster, roots,
                                           self.depth_spin.value(),
-                                          self.sysdrive_chk.isChecked())
+                                          self.act_sysdrive.isChecked())
         self.search_worker.moveToThread(self.search_thread)
         self.search_thread.started.connect(self.search_worker.run)
         self.search_worker.progress.connect(
@@ -2334,7 +2364,7 @@ class ScanDriveGUI(QMainWindow):
     def _preprocess(self):
         if not self.roster:
             return
-        vols = sd.list_drive_roots(include_system=self.sysdrive_chk.isChecked())
+        vols = sd.list_drive_roots(include_system=self.act_sysdrive.isChecked())
         if not vols:
             QMessageBox.warning(self, "No drives", "No mounted volumes to search.")
             return
@@ -2365,9 +2395,10 @@ class ScanDriveGUI(QMainWindow):
         self.status_lbl.setText("Preprocess check failed.")
 
     # -- prepare RecordingMeta ---------------------------------------------
-    def _prepare_meta(self):
+    def _prepare_meta(self, auto: bool = False):
         if not self.roster:
             return
+        self._meta_auto = bool(auto)
         path = self.xlsx_edit.text().strip()
         try:
             raw = pd.read_excel(path, sheet_name=self.sheet_combo.currentText().strip() or "Raw")
@@ -2378,11 +2409,11 @@ class ScanDriveGUI(QMainWindow):
         self._meta_raw = raw
         self.meta_btn.setEnabled(False)
         self.status_lbl.setText("Searching all drives for video folders…")
-        roots = [e.text().strip() for e in self.drive_edits]
+        roots = self._drive_paths()
         self.search_thread = QThread()
         self.search_worker = SearchWorker(self.roster, roots,
                                           self.depth_spin.value(),
-                                          self.sysdrive_chk.isChecked())
+                                          self.act_sysdrive.isChecked())
         self.search_worker.moveToThread(self.search_thread)
         self.search_thread.started.connect(self.search_worker.run)
         self.search_worker.progress.connect(
@@ -2395,13 +2426,30 @@ class ScanDriveGUI(QMainWindow):
 
     def _meta_plan(self, combined: dict):
         self.meta_btn.setEnabled(True)
+        auto = getattr(self, "_meta_auto", False)
+        self._meta_auto = False
         try:
             plan = pmeta.plan_meta(self.roster, combined.get("sessions", {}), self._meta_raw)
         except Exception as exc:  # pragma: no cover
+            if auto:
+                self.status_lbl.setText("Scan done · auto RecordingMeta step failed.")
+                return
             QMessageBox.critical(self, "Prepare failed", str(exc))
             self.status_lbl.setText("Prepare failed.")
             return
         n_write = sum(1 for p in plan if p["action"] == pmeta.WRITE)
+        if auto:
+            # Auto mode (after scan): write straight away — plan_meta never overwrites
+            # an existing RecordingMeta.xlsx, so there is nothing to review/confirm.
+            if n_write:
+                results = pmeta.write_plan(plan)
+                nok = sum(1 for r in results if r["result"] == "written")
+                nerr = sum(1 for r in results if r["result"] == "error")
+                self.status_lbl.setText(f"Scan done · auto-wrote {nok} RecordingMeta.xlsx"
+                                        + (f" ({nerr} error)" if nerr else "") + ".")
+            else:
+                self.status_lbl.setText("Scan done · RecordingMeta already present for all sessions.")
+            return
         self.status_lbl.setText(f"RecordingMeta: {n_write} to write.")
         MetaDialog(plan, self).exec()
 
@@ -2431,6 +2479,9 @@ class ScanDriveGUI(QMainWindow):
         paths = self.results[r].get("paths") or []
         if paths:
             _reveal(paths[0])
+        elif self.results[r].get("status") in ("MISSING", "PARTIAL"):
+            # nothing found under the selected drives — offer to locate it everywhere
+            self._search_all()
 
     def _export(self):
         if not any(self.results):

@@ -50,6 +50,9 @@ _CAM_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
 _DATE_RE = re.compile(r"^\d{8}$")
 _RAT_RE = re.compile(r"[Rr]at\s*_?(\d+)")
 _TEMP_RE = re.compile(r"(^\.goutputstream-|\.tmp$|\.partial$|\.crdownload$)", re.I)
+# A raw camera video/meta is named eye01_…, …, eye12_… . Everything else that ends
+# in .mp4 (a stitched Rat video, collected_frames, a DLC-labelled clip) is derived.
+_EYE_RE = re.compile(r"^eye\d\d[_-]", re.I)
 
 PHASES = ("pre", "task", "post")
 
@@ -143,6 +146,23 @@ def detect_session_splits(sess):
         times.setdefault(ph, set()).add(ts)
         if _SPLIT_SUFFIX_RE.search(stem):
             forced.add(ph)
+        # A crash-restart part can be nested INSIDE the phase's folder rather than a
+        # sibling (…_pre.rec\…_pre.rec\), so also read one level down. Same-timestamp
+        # children (the folder's own .rec/.trodesconf) dedupe via the set.
+        if c.is_dir():
+            try:
+                nested = list(c.iterdir())
+            except OSError:
+                nested = []
+            for g in nested:
+                gst = _stem(g.name)
+                gph = _classify_phase(gst)
+                if gph is None or _CAM_DIR_RE.match(g.name) or g.name.lower().endswith("_merged.rec"):
+                    continue
+                gm = _REC_TS_RE.search(g.name)
+                times.setdefault(gph, set()).add(gm.group(1) if gm else gst)
+                if _SPLIT_SUFFIX_RE.search(gst):
+                    forced.add(gph)
     out = {}
     for ph, tss in times.items():
         if len(tss) > 1 or ph in forced:
@@ -370,6 +390,27 @@ def _classify_file(name):
     return "other"
 
 
+# Names that mean a subfolder is processed OUTPUT (a tracked/analysed op folder left
+# inside a raw date folder), not raw acquisition.
+_DERIVED_MARKERS = ("coordinates_full", "collected_frames", ".nwb", "_analysis_final")
+
+
+def _is_derived_dir(entries):
+    """True if a subfolder is a processed op folder (holds tracking coordinates, a
+    collected-frames/DLC video, or an nwb), so the scan skips it instead of counting
+    its derived .mp4s / .nwb as raw camera data."""
+    for e in entries:
+        n = e.name.lower()
+        if any(mk in n for mk in _DERIVED_MARKERS):
+            return True
+        try:
+            if n == "out" and e.is_dir():
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def scan_session(sess, issues, inv_rows, file_rows):
     """Check one session (ephys-phase completeness + zero-size .rec + cross-rat +
     junk) AND inventory it. Appends issues, one inventory row (per session), and
@@ -377,6 +418,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
     rat_dir = sess.parent.name
     rat_no = _rat_of(rat_dir)
     mp4s, rec_files, phases, rec_folders, empty_dirs = [], [], set(), [], []
+    cam_videos = {}                        # unique camera videos: name.lower() -> (path, size)
     n = {k: 0 for k in ("video", "meta", "rec", "merged", "logger", "config", "other")}
     bytes_video = bytes_ephys = 0
     phase_bytes = {p: 0 for p in PHASES}   # ephys bytes per pre/task/post
@@ -390,9 +432,16 @@ def scan_session(sess, issues, inv_rows, file_rows):
         groups.append(("(date folder)", loose, False))
     for sub in sorted(p for p in sess.iterdir() if p.is_dir()):
         entries = list(sub.iterdir())
+        if _is_derived_dir(entries):
+            continue                           # processed op output, not raw — skip
         if not entries:
-            empty_dirs.append(sub)
-        is_cam = _CAM_DIR_RE.match(sub.name) or any(p.suffix.lower() == ".mp4" for p in entries)
+            # an empty CAMERA-timestamp folder is a benign leftover (the videos are
+            # loose or in another folder); only flag a genuinely empty recording folder.
+            if not _CAM_DIR_RE.match(sub.name):
+                empty_dirs.append(sub)
+            continue
+        # camera folder = a timestamp-named folder, or one holding eye* videos
+        is_cam = bool(_CAM_DIR_RE.match(sub.name)) or any(_EYE_RE.match(p.name) for p in entries)
         groups.append((sub.name, [p for p in sub.rglob("*") if p.is_file()], not is_cam))
 
     for folder, files, is_recording in groups:
@@ -407,8 +456,8 @@ def scan_session(sess, issues, inv_rows, file_rows):
             n[cat] += 1
             file_rows.append(dict(rat=rat_dir, session=sess.name, folder=folder,
                                   file=p.name, type=cat, size_bytes=size))
-            if cat == "video":
-                mp4s.append(p); bytes_video += max(size, 0)
+            if cat == "video" and _EYE_RE.match(p.name):
+                cam_videos.setdefault(p.name.lower(), (p, max(size, 0)))
             elif cat in ("rec", "merged", "logger"):
                 rec_files.append(p); bytes_ephys += max(size, 0); has_rec_here = True
                 here_ephys += max(size, 0)
@@ -427,6 +476,10 @@ def scan_session(sess, issues, inv_rows, file_rows):
                 phase_bytes[ph] += here_ephys
             rec_folders.append(f"{folder}[{ph or '?'}]")
 
+    # camera-video totals from the DEDUPED unique eye videos: drops derived .mp4s and
+    # the same video counted both loose AND in its timestamp subfolder.
+    mp4s = [pp for pp, _ in cam_videos.values()]
+    bytes_video = sum(sz for _, sz in cam_videos.values())
     has_ephys = bool(rec_files)
 
     # (3) zero-byte .rec / logger
@@ -452,7 +505,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
     inv_rows.append(dict(
         rat=rat_dir, session=sess.name, has_ephys=int(has_ephys),
         phases="+".join(p for p in PHASES if p in phases) if has_ephys else "-",
-        n_video=n["video"], n_meta=n["meta"],
+        n_video=len(cam_videos), n_meta=n["meta"],
         n_rec=n["rec"], n_merged=n["merged"], n_logger=n["logger"],
         video_gb=round(bytes_video / 1e9, 2), ephys_gb=round(bytes_ephys / 1e9, 2),
         phase_bytes=dict(phase_bytes),
