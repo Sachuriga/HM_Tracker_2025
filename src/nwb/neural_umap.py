@@ -39,15 +39,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import visualize_nwb as V     # load_position, load_nodes, read_trials_raw, align_trials, SCALE_*
 
 
-def _select_units(nwb, qualities):
+def _select_units(nwb, qualities, cell_type=None):
     """[(unit_id, spike_times_seconds), ...] for units whose quality_label is in
-    `qualities` (e.g. {'good'} or {'good','mua'})."""
+    `qualities` (e.g. {'good'} or {'good','mua'}) and — when `cell_type` is given
+    (e.g. 'pyramidal') — whose cell_type matches."""
     udf = nwb.units.to_dataframe()
     ql = (udf["quality_label"].astype(str).str.lower()
           if "quality_label" in udf.columns else None)
+    ct = (udf["cell_type"].astype(str).str.lower()
+          if "cell_type" in udf.columns else None)
     out = []
     for uid, r in udf.iterrows():
         if ql is not None and ql.loc[uid] not in qualities:
+            continue
+        if cell_type is not None and ct is not None and ct.loc[uid] != cell_type:
             continue
         out.append((uid, np.asarray(r["spike_times"], dtype=float)))
     return out
@@ -205,15 +210,32 @@ def _assign_islands(x, y, nodes):
     return np.array([node_island[ids[i]] for i in nn], dtype=int), n_isl
 
 
+def _adjacent_nodes(nodes, goal_id, k=3, k_short=1.35):
+    """The k node ids directly adjacent to `goal_id` (nearest neighbours within
+    k_short x the median node spacing = one honeycomb step). [] if goal not present."""
+    if goal_id not in nodes:
+        return []
+    ids = list(nodes.keys())
+    P = np.array([nodes[i] for i in ids], dtype=float)
+    gi = ids.index(goal_id)
+    d = np.hypot(P[:, 0] - P[gi, 0], P[:, 1] - P[gi, 1]); d[gi] = np.inf
+    D = np.hypot(P[:, None, 0] - P[None, :, 0], P[:, None, 1] - P[None, :, 1])
+    np.fill_diagonal(D, np.inf)
+    med = float(np.median(D.min(1)))
+    within = np.where(d <= k_short * med)[0]
+    order = within[np.argsort(d[within])][:k]
+    return [ids[i] for i in order]
+
+
 def embed_session(nwb_path, qualities, dt=0.1, sigma_s=0.3, speed_thresh=0.05,
                   n_neighbors=50, min_dist=0.1, n_components=3, max_bins=25000,
-                  seed=42):
+                  seed=42, cell_type=None):
     import umap  # imported lazily so the rest of the runner works without it
     with NWBHDF5IO(str(nwb_path), "r") as io:
         nwb = io.read()
         if nwb.units is None or len(nwb.units.id) == 0:
             print("  no units — skipping."); return None
-        units = _select_units(nwb, qualities)
+        units = _select_units(nwb, qualities, cell_type)
         pos = V.load_position(nwb)
         if pos is None or len(units) < 3:
             print(f"  need position + >=3 units (have {len(units)} units) — skipping.")
@@ -259,6 +281,21 @@ def embed_session(nwb_path, qualities, dt=0.1, sigma_s=0.3, speed_thresh=0.05,
         # which island (hexagon cluster) the bin's nearest node belongs to.
         loc_island, _n_isl = _assign_islands(xb, yb, nodes)
 
+        # first & second GOAL-RUN (type-1) trials: 0=first, 1=second, NaN elsewhere.
+        goal_runs = [(a, b) for (tp, _g, _s, a, b) in (trials or []) if tp == 1]
+        goal_run = np.full(len(centers), np.nan)
+        for gi, (a, b) in enumerate(goal_runs[:2]):
+            goal_run[(centers >= a) & (centers <= b)] = float(gi)
+        # goal node = most common goal among the goal-run trials (for goal+adjacent).
+        gvals = [g for (tp, g, _s, _a, _b) in (trials or []) if tp == 1 and g is not None]
+        goal_node = int(max(set(gvals), key=gvals.count)) if gvals else -1
+
+        # the (up to 3) free-roaming (type 4/5) periods: 0,1,2; NaN elsewhere.
+        fr_trials = [(a, b) for (tp, _g, _s, a, b) in (trials or []) if tp in (4, 5)]
+        free_roam = np.full(len(centers), np.nan)
+        for fi, (a, b) in enumerate(fr_trials[:3]):
+            free_roam[(centers >= a) & (centers <= b)] = float(fi)
+
         # embed only moving bins (paper's RUN epochs)
         keep = vb > speed_thresh
         if keep.sum() < 50:
@@ -279,12 +316,16 @@ def embed_session(nwb_path, qualities, dt=0.1, sigma_s=0.3, speed_thresh=0.05,
                "time": centers[idx], "ttype": ttype[idx], "goal_dist": goal_d[idx],
                "trial": trial_id[idx], "in_trial": in_trial[idx],
                "phase2": phase2[idx], "loc_node": loc_node[idx], "loc_bridge": loc_bridge[idx],
-               "island": loc_island[idx],
-               "quality": "+".join(sorted(qualities)), "n_units": len(units)}
+               "island": loc_island[idx], "goal_run": goal_run[idx], "goal_node": goal_node,
+               "free_roam": free_roam[idx],
+               "quality": "+".join(sorted(qualities)) + (" pyramidal" if cell_type == "pyramidal"
+                                                         else (f" {cell_type}" if cell_type else "")),
+               "n_units": len(units)}
 
         out_dir = nwb_path.parent / "umap"
         out_dir.mkdir(exist_ok=True)
-        tag = "_".join(sorted(qualities))
+        tag = "_".join(sorted(qualities)) + ("_pyr" if cell_type == "pyramidal"
+                                             else (f"_{cell_type[:3]}" if cell_type else ""))
         pfx = file_prefix(nwb_path.parent)               # rat_sessiondate_ prefix
         np.savez(out_dir / f"{pfx}umap_{tag}.npz", **res)
         _plot(out_dir / f"{pfx}umap_{tag}.pdf", res, nwb_path.name)
@@ -346,8 +387,8 @@ def _plot(pdf_path, res, nwb_name):
     panels = [
         dict(kind="cont", c=res["x"], cmap="viridis", label="X position (m)"),
         dict(kind="cont", c=res["y"], cmap="plasma", label="Y position (m)"),
-        # speed CAPPED at 0.6 m/s: everything faster is coloured as 0.6.
-        dict(kind="cont", c=np.minimum(res["speed"], 0.6), cmap="hot",
+        # speed CAPPED at 0.6 m/s (everything faster coloured as 0.6), jet colormap.
+        dict(kind="cont", c=np.minimum(res["speed"], 0.6), cmap="jet",
              vmin=0.0, vmax=0.6, label="Speed (m/s, capped at 0.6)"),
         dict(kind="cont", c=res["time"], cmap="cool", label="Session time (s)"),
     ]
@@ -397,6 +438,59 @@ def _plot(pdf_path, res, nwb_name):
         panels.append(dict(kind="rgba", rgba=rgba_i, legend=legend_i, label="Hexmaze island",
                            node_color=node_color_i, bridge_color=bridge_color_i))
 
+    # ---- first & second goal run (rest grey) ----
+    gr = res.get("goal_run", np.array([np.nan]))
+    if np.isfinite(gr).any():
+        cols = ["#1f77b4", "#d62728"]                       # 1st=blue, 2nd=red
+        rgba = np.tile(np.array([0.85, 0.85, 0.85, 0.25]), (len(gr), 1))
+        rgba[gr == 0] = mcolors.to_rgba(cols[0])
+        rgba[gr == 1] = mcolors.to_rgba(cols[1])
+        legend = [Line2D([0], [0], marker="o", color="w", markerfacecolor=cols[0],
+                         markersize=8, label="1st goal run"),
+                  Line2D([0], [0], marker="o", color="w", markerfacecolor=cols[1],
+                         markersize=8, label="2nd goal run")]
+        panels.append(dict(kind="rgba", rgba=rgba, legend=legend,
+                           label="1st & 2nd goal run (rest grey)"))
+
+    # ---- the 3 free-roaming periods (rest grey) ----
+    frm = res.get("free_roam", np.array([np.nan]))
+    if np.isfinite(frm).any():
+        fcols = ["#1b9e77", "#d95f02", "#7570b3"]           # FR1 / FR2 / FR3
+        rgba = np.tile(np.array([0.85, 0.85, 0.85, 0.25]), (len(frm), 1))
+        legend = []
+        for i in range(3):
+            m = frm == i
+            if m.any():
+                rgba[m] = mcolors.to_rgba(fcols[i])
+                legend.append(Line2D([0], [0], marker="o", color="w", markerfacecolor=fcols[i],
+                                     markersize=8, label=f"free-roaming {i + 1}"))
+        panels.append(dict(kind="rgba", rgba=rgba, legend=legend,
+                           label="3 free-roaming periods (rest grey)"))
+
+    # ---- goal node + its 3 adjacent nodes (rest grey) ----
+    gn = int(res.get("goal_node", -1))
+    if nodes and gn in nodes:
+        adj = _adjacent_nodes(nodes, gn, 3)
+        hi = {gn: "#FFD700"}                                 # goal = gold
+        for nid, col in zip(adj, ["#e41a1c", "#377eb8", "#4daf4a"]):
+            hi[nid] = col
+        ln = res.get("loc_node", np.full(len(gr), -1))
+        rgba = np.tile(np.array([0.85, 0.85, 0.85, 0.25]), (len(ln), 1))
+        legend = [Line2D([0], [0], marker="o", color="w", markerfacecolor="#FFD700",
+                         markersize=9, label=f"goal {gn}")]
+        for nid in [gn] + adj:
+            rgba[ln == nid] = mcolors.to_rgba(hi[nid])
+        for nid in adj:
+            legend.append(Line2D([0], [0], marker="o", color="w", markerfacecolor=hi[nid],
+                                 markersize=8, label=f"adjacent {nid}"))
+        node_color_g = {nid: (0.85, 0.85, 0.85, 0.6) for nid in nodes}
+        for nid, col in hi.items():
+            node_color_g[nid] = mcolors.to_rgba(col)
+        bridge_color_g = {bi: (0.85, 0.85, 0.85, 0.5) for bi in range(len(_bridges(nodes)))}
+        panels.append(dict(kind="rgba", rgba=rgba, legend=legend,
+                           label="Goal + 3 adjacent nodes (rest grey)",
+                           node_color=node_color_g, bridge_color=bridge_color_g))
+
     proj = [(0, 1, "UMAP 1", "UMAP 2"), (0, 2, "UMAP 1", "UMAP 3"),
             (1, 2, "UMAP 2", "UMAP 3")]
 
@@ -441,7 +535,9 @@ def run(output_folder, qualities, **kw):
     if nwb_path is None:
         print(f"No NWB in {output_folder}."); return
     nwb_path = Path(nwb_path)
-    print(f"UMAP embedding {nwb_path} using units: {'+'.join(sorted(qualities))}")
+    ct = kw.get("cell_type")
+    print(f"UMAP embedding {nwb_path} using units: {'+'.join(sorted(qualities))}"
+          + (f" ({ct} only)" if ct else ""))
     embed_session(nwb_path, set(qualities), **kw)
 
 
@@ -455,6 +551,9 @@ if __name__ == "__main__":
     ap.add_argument("--sigma_s", type=float, default=0.3, help="Gaussian smoothing sigma (s).")
     ap.add_argument("--n_neighbors", type=int, default=50)
     ap.add_argument("--min_dist", type=float, default=0.1)
+    ap.add_argument("--cell_type", default=None, choices=["pyramidal", "interneuron"],
+                    help="restrict to this putative cell type (default: all cell types).")
     a = ap.parse_args()
     run(a.output_folder, set(q.lower() for q in a.quality),
-        dt=a.dt, sigma_s=a.sigma_s, n_neighbors=a.n_neighbors, min_dist=a.min_dist)
+        dt=a.dt, sigma_s=a.sigma_s, n_neighbors=a.n_neighbors, min_dist=a.min_dist,
+        cell_type=a.cell_type)

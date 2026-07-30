@@ -70,7 +70,7 @@ MENU = [
     ("u", "Add curated Units (metrics + waveforms) to NWB (runs after w)"),
     ("v", "Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)"),
     ("b", "Bayesian position decoder + spikes/decoded-on-video overlays per session (good and good+mua)"),
-    ("m", "Neural population UMAP per session (good and good+mua; Gardner et al. 2022)"),
+    ("m", "Neural population UMAP per session (good & good+mua, all + pyramidal-only; Gardner et al. 2022)"),
     ("s", "Session summary (cross-session per-animal plots by date/repeat/session)"),
     ("t", "Drive scan (videos playable + ephys has pre/task/post + non-zero .rec)"),
 ]
@@ -763,19 +763,25 @@ def main():
         print(f"\n[MASTER] Position-decoder complete for all {total} folder(s).")
 
     if has["m"]:
-        # UMAP population embedding per session, both GOOD-only and GOOD+MUA.
+        # UMAP population embedding per session: good and good+mua, each ALL cell
+        # types and a PYRAMIDAL-only version (4 embeddings/session).
         print("\n" + "=" * 56)
-        print("[MASTER] Running NEURAL-UMAP sequentially (good and good+mua)...")
+        print("[MASTER] Running NEURAL-UMAP sequentially (good & good+mua; all + pyramidal)...")
         print("=" * 56)
         total = len(seq_ops)
         for i, (_ip, op) in enumerate(seq_ops, 1):
             print(f"\n[UMAP {i}/{total}] Embedding: {op}")
             if Path("./src/nwb/neural_umap.py").exists():
                 for quals in (["good"], ["good", "mua"]):
-                    rc = run([PYTHON, "-u", "./src/nwb/neural_umap.py", "--output_folder", op,
-                              "--config", config, "--quality", *quals])
-                    print(f"[UMAP {i}/{total}] units {'+'.join(quals)}: "
-                          f"{'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
+                    for ct in (None, "pyramidal"):
+                        cmd = [PYTHON, "-u", "./src/nwb/neural_umap.py", "--output_folder", op,
+                               "--config", config, "--quality", *quals]
+                        if ct:
+                            cmd += ["--cell_type", ct]
+                        rc = run(cmd)
+                        print(f"[UMAP {i}/{total}] units {'+'.join(quals)}"
+                              f"{' ' + ct if ct else ''}: "
+                              f"{'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
             else:
                 print("[UMAP] neural_umap.py NOT found.")
         print(f"\n[MASTER] Neural-UMAP complete for all {total} folder(s).")
