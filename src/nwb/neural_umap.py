@@ -29,6 +29,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.lines import Line2D
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3d projection)
 from scipy.ndimage import gaussian_filter1d
 from pynwb import NWBHDF5IO
@@ -77,6 +79,132 @@ def _speed(x, y, t):
     return np.nan_to_num(v, nan=0.0)
 
 
+def _seg_dist(x, y, p1, p2):
+    """Distance from each (x, y) point to the segment p1-p2 (all in metres)."""
+    ax, ay = float(p1[0]), float(p1[1]); bx, by = float(p2[0]), float(p2[1])
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    if L2 <= 0:
+        return np.hypot(x - ax, y - ay)
+    tt = np.clip(((x - ax) * dx + (y - ay) * dy) / L2, 0.0, 1.0)
+    return np.hypot(x - (ax + tt * dx), y - (ay + tt * dy))
+
+
+_BRIDGE_CACHE = {}
+
+
+def _bridges(nodes, k_short=1.35):
+    """All bridge/corridor segments of the hexmaze: the short honeycomb edges WITHIN
+    each island (nodes within k_short x the median spacing) PLUS the long corridors
+    BETWEEN islands (the shortest edge joining each still-separate component, added
+    until the whole maze is one graph — an MST over components). Unlike
+    V._maze_edges (honeycomb only) this includes the inter-island corridors, so a
+    point mid-corridor is assigned to a real bridge. Cached; [(p1,p2), ...] metres."""
+    key = (len(nodes), round(k_short, 3))
+    if key in _BRIDGE_CACHE:
+        return _BRIDGE_CACHE[key]
+    P = np.array([nodes[i] for i in nodes], dtype=float)
+    if len(P) < 2:
+        _BRIDGE_CACHE[key] = []
+        return []
+    D = np.hypot(P[:, None, 0] - P[None, :, 0], P[:, None, 1] - P[None, :, 1])
+    np.fill_diagonal(D, np.inf)
+    med = float(np.median(D.min(1)))
+    n = len(P)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]; a = parent[a]
+        return a
+
+    thr = k_short * med
+    edges = [(i, j) for i in range(n) for j in range(i + 1, n) if D[i, j] <= thr]
+    for i, j in edges:
+        parent[find(i)] = find(j)                       # union short (honeycomb) edges
+    # connect remaining components with their shortest cross-component edge
+    while len({find(i) for i in range(n)}) > 1:
+        best, best_d = None, np.inf
+        roots = np.array([find(i) for i in range(n)])
+        for i in range(n):
+            diff = roots != roots[i]
+            if diff.any():
+                j = int(np.where(diff, D[i], np.inf).argmin())
+                if D[i, j] < best_d:
+                    best_d, best = D[i, j], (i, j)
+        if best is None:
+            break
+        parent[find(best[0])] = find(best[1]); edges.append(best)
+    out = [(P[i], P[j]) for i, j in edges]
+    _BRIDGE_CACHE[key] = out
+    return out
+
+
+def _hex_assign(x, y, nodes, node_frac=0.45):
+    """Per-sample hexmaze location: the id of the node the animal is AT (within
+    node_frac x the median node spacing), else -1; and the index of the nearest
+    bridge/corridor it is ON otherwise, else -1. Nodes and bridges are disjoint
+    labels so they can be coloured independently."""
+    n = len(x)
+    loc_node = np.full(n, -1, dtype=int)
+    loc_bridge = np.full(n, -1, dtype=int)
+    if not nodes or n == 0:
+        return loc_node, loc_bridge
+    ids = np.array(list(nodes.keys()))
+    P = np.array([nodes[i] for i in ids], dtype=float)                       # (Nn, 2)
+    dn = np.hypot(x[:, None] - P[None, :, 0], y[:, None] - P[None, :, 1])    # (n, Nn)
+    nn_i = dn.argmin(1); nn_d = dn.min(1)
+    dd = np.hypot(P[:, None, 0] - P[None, :, 0], P[:, None, 1] - P[None, :, 1])
+    np.fill_diagonal(dd, np.inf)
+    med = float(np.median(dd.min(1))) if len(P) > 1 else 1.0
+    at_node = nn_d <= node_frac * med
+    loc_node[at_node] = ids[nn_i[at_node]]
+    bridges = _bridges(nodes)
+    if bridges and (~at_node).any():
+        seg_d = np.stack([_seg_dist(x, y, p1, p2) for p1, p2 in bridges], axis=1)  # (n, B)
+        nb_i = seg_d.argmin(1)
+        loc_bridge[~at_node] = nb_i[~at_node]
+    return loc_node, loc_bridge
+
+
+def _node_islands(nodes, k=1.5, min_size=5):
+    """{node_id: island_index} + n_islands. Islands are the maze's separate hexagon
+    clusters = connected components of the graph joining nodes within k x the median
+    node spacing; tiny components merge into the nearest large one. (This maze has 4.)"""
+    ids = list(nodes.keys())
+    P = np.array([nodes[i] for i in ids], dtype=float)
+    if len(P) < 2:
+        return {i: 0 for i in ids}, 1
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    D = np.hypot(P[:, None, 0] - P[None, :, 0], P[:, None, 1] - P[None, :, 1])
+    np.fill_diagonal(D, np.inf)
+    med = float(np.median(D.min(1)))
+    _n, lab = connected_components(csr_matrix(D <= k * med), directed=False)
+    sizes = np.bincount(lab)
+    large = [c for c in range(len(sizes)) if sizes[c] >= min_size] or list(range(len(sizes)))
+    cent = {c: P[lab == c].mean(0) for c in large}
+    order = sorted(large, key=lambda c: (round(cent[c][1], 1), cent[c][0]))  # top-left first
+    isl_id = {c: i for i, c in enumerate(order)}
+    node_island = {}
+    for k2, nid in enumerate(ids):
+        c = lab[k2]
+        node_island[nid] = isl_id[c] if c in isl_id else \
+            isl_id[min(large, key=lambda ci: np.hypot(*(P[k2] - cent[ci])))]
+    return node_island, len(large)
+
+
+def _assign_islands(x, y, nodes):
+    """Island index per (x, y) sample = the island of its nearest node (-1 if none)."""
+    if not nodes:
+        return np.full(len(x), -1, dtype=int), 0
+    node_island, n_isl = _node_islands(nodes)
+    ids = list(nodes.keys())
+    P = np.array([nodes[i] for i in ids], dtype=float)
+    nn = np.hypot(x[:, None] - P[None, :, 0], y[:, None] - P[None, :, 1]).argmin(1)
+    return np.array([node_island[ids[i]] for i in nn], dtype=int), n_isl
+
+
 def embed_session(nwb_path, qualities, dt=0.1, sigma_s=0.3, speed_thresh=0.05,
                   n_neighbors=50, min_dist=0.1, n_components=3, max_bins=25000,
                   seed=42):
@@ -119,6 +247,18 @@ def embed_session(nwb_path, qualities, dt=0.1, sigma_s=0.3, speed_thresh=0.05,
                 gx, gy = nodes[goal]
                 goal_d[m] = np.hypot(xb[m] - gx, yb[m] - gy)
 
+        # before / after the 2nd free-roaming (type 4/5) trial: split at its onset.
+        specials = [(a, b) for (tp, _g, _s, a, b) in (trials or []) if tp in (4, 5)]
+        phase2 = np.full(len(centers), np.nan)
+        if len(specials) >= 2:
+            phase2 = np.where(centers < specials[1][0], 0.0, 1.0)   # 0=before, 1=after
+
+        # hexmaze location per bin: which node the animal is AT, or which bridge/
+        # corridor it is ON (nodes vs bridges coloured independently downstream).
+        loc_node, loc_bridge = _hex_assign(xb, yb, nodes)
+        # which island (hexagon cluster) the bin's nearest node belongs to.
+        loc_island, _n_isl = _assign_islands(xb, yb, nodes)
+
         # embed only moving bins (paper's RUN epochs)
         keep = vb > speed_thresh
         if keep.sum() < 50:
@@ -138,6 +278,8 @@ def embed_session(nwb_path, qualities, dt=0.1, sigma_s=0.3, speed_thresh=0.05,
         res = {"emb": emb, "x": xb[idx], "y": yb[idx], "speed": vb[idx],
                "time": centers[idx], "ttype": ttype[idx], "goal_dist": goal_d[idx],
                "trial": trial_id[idx], "in_trial": in_trial[idx],
+               "phase2": phase2[idx], "loc_node": loc_node[idx], "loc_bridge": loc_bridge[idx],
+               "island": loc_island[idx],
                "quality": "+".join(sorted(qualities)), "n_units": len(units)}
 
         out_dir = nwb_path.parent / "umap"
@@ -149,54 +291,146 @@ def embed_session(nwb_path, qualities, dt=0.1, sigma_s=0.3, speed_thresh=0.05,
         return res
 
 
-def _scatter3d(ax, emb, c, cmap, label, title):
-    p = ax.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=c, cmap=cmap, s=4,
-                   alpha=0.7, linewidths=0, rasterized=True)
-    ax.set_title(title, fontsize=11)
-    ax.set_xlabel("UMAP 1"); ax.set_ylabel("UMAP 2"); ax.set_zlabel("UMAP 3")
-    cb = ax.figure.colorbar(p, ax=ax, fraction=0.03, pad=0.08)
-    cb.set_label(label)
+def _hex_colors(loc_node, loc_bridge, nodes):
+    """(rgba per point, node_color dict, bridge_color dict). Nodes are coloured by a
+    rainbow (hsv) per node; bridges by an INDEPENDENT greyscale ramp per bridge, so
+    'at a node' reads as a distinct colour and 'on a bridge' as a grey."""
+    ids = list(nodes.keys())
+    nn = max(len(ids), 1)
+    ncm = plt.get_cmap("hsv")
+    node_color = {nid: ncm(k / nn) for k, nid in enumerate(ids)}
+    bridges = _bridges(nodes)
+    nb = max(len(bridges), 1)
+    gcm = plt.get_cmap("gray")
+    bridge_color = {bi: gcm(0.25 + 0.4 * (bi / max(nb - 1, 1))) for bi in range(len(bridges))}
+    rgba = np.tile(np.array([0.85, 0.85, 0.85, 0.35]), (len(loc_node), 1))  # unassigned
+    nm = loc_node >= 0
+    if nm.any():
+        rgba[nm] = np.array([node_color[int(v)] for v in loc_node[nm]])
+    bm = loc_bridge >= 0
+    if bm.any():
+        rgba[bm] = np.array([bridge_color[int(v)] for v in loc_bridge[bm]])
+    return rgba, node_color, bridge_color
+
+
+def _draw_maze_key(ax, nodes, node_color, bridge_color):
+    """The hexmaze drawn with the SAME node/bridge colours the UMAP points use, so a
+    coloured UMAP point can be matched to a maze location."""
+    for bi, (p1, p2) in enumerate(_bridges(nodes)):
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], color=bridge_color[bi], lw=2.5, zorder=1)
+    for nid, (nx, ny) in nodes.items():
+        ax.scatter(nx, ny, color=node_color[nid], s=70, edgecolors="k", linewidths=0.4, zorder=2)
+    ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xlim(V.MAZE_EXTENT[0], V.MAZE_EXTENT[1]); ax.set_ylim(V.MAZE_EXTENT[3], V.MAZE_EXTENT[2])
+    ax.set_title("maze key — node colours (rainbow) vs bridge colours (greys)")
+
+
+def _panel_scatter(ax, xs, ys, panel, zs=None):
+    """Scatter one panel onto a 2D or 3D axis. Continuous panels use a cmap (the
+    caller adds the colourbar); categorical / rgba panels pass per-point colours."""
+    kw = dict(s=4, alpha=0.7, linewidths=0, rasterized=True)
+    if panel["kind"] == "cont":
+        args = (xs, ys) if zs is None else (xs, ys, zs)
+        return ax.scatter(*args, c=panel["c"], cmap=panel["cmap"],
+                          vmin=panel.get("vmin"), vmax=panel.get("vmax"), **kw)
+    args = (xs, ys) if zs is None else (xs, ys, zs)
+    ax.scatter(*args, c=panel["rgba"], **kw)
+    return None
 
 
 def _plot(pdf_path, res, nwb_name):
     from matplotlib.backends.backend_pdf import PdfPages
     emb = res["emb"]
+
+    # ---- continuous colour variables (cmap + colourbar) ----
     panels = [
-        ("x", res["x"], "viridis", "X position (m)"),
-        ("y", res["y"], "plasma", "Y position (m)"),
-        ("speed", res["speed"], "hot", "Speed (m/s)"),
-        ("time", res["time"], "cool", "Session time (s)"),
+        dict(kind="cont", c=res["x"], cmap="viridis", label="X position (m)"),
+        dict(kind="cont", c=res["y"], cmap="plasma", label="Y position (m)"),
+        # speed CAPPED at 0.6 m/s: everything faster is coloured as 0.6.
+        dict(kind="cont", c=np.minimum(res["speed"], 0.6), cmap="hot",
+             vmin=0.0, vmax=0.6, label="Speed (m/s, capped at 0.6)"),
+        dict(kind="cont", c=res["time"], cmap="cool", label="Session time (s)"),
     ]
     if np.isfinite(res.get("trial", np.array([np.nan]))).any():
-        panels.append(("trial", res["trial"], "gist_rainbow", "Trial number"))
+        panels.append(dict(kind="cont", c=res["trial"], cmap="gist_rainbow", label="Trial number"))
     if np.isfinite(res["goal_dist"]).any():
-        panels.append(("goal", res["goal_dist"], "magma", "Distance to goal (m)"))
+        panels.append(dict(kind="cont", c=res["goal_dist"], cmap="magma", label="Distance to goal (m)"))
     if np.isfinite(res["ttype"]).any():
-        panels.append(("ttype", res["ttype"], "tab10", "Trial type"))
+        panels.append(dict(kind="cont", c=res["ttype"], cmap="tab10", label="Trial type"))
 
-    # the three 2D planes of the 3D embedding
+    # ---- before / after the 2nd free-roaming trial (categorical) ----
+    ph = res.get("phase2", np.array([np.nan]))
+    if np.isfinite(ph).any():
+        cols = ["#1f77b4", "#d62728"]                       # before=blue, after=red
+        rgba = np.tile(np.array([0.85, 0.85, 0.85, 0.3]), (len(ph), 1))
+        rgba[ph == 0] = mcolors.to_rgba(cols[0])
+        rgba[ph == 1] = mcolors.to_rgba(cols[1])
+        legend = [Line2D([0], [0], marker="o", color="w", markerfacecolor=cols[0],
+                         markersize=8, label="before 2nd free-roaming"),
+                  Line2D([0], [0], marker="o", color="w", markerfacecolor=cols[1],
+                         markersize=8, label="after 2nd free-roaming")]
+        panels.append(dict(kind="cat", rgba=rgba, legend=legend,
+                           label="2nd free-roaming (before/after)"))
+
+    # ---- hexmaze location: nodes vs bridges (independent colours) ----
+    nodes = V.load_nodes()
+    if nodes and (np.any(res.get("loc_node", np.array([-1])) >= 0)
+                  or np.any(res.get("loc_bridge", np.array([-1])) >= 0)):
+        rgba, node_color, bridge_color = _hex_colors(res["loc_node"], res["loc_bridge"], nodes)
+        panels.append(dict(kind="rgba", rgba=rgba, label="Hexmaze location (node vs bridge)",
+                           node_color=node_color, bridge_color=bridge_color))
+
+    # ---- island (which hexagon cluster) ----
+    isl = res.get("island", np.array([-1]))
+    if nodes and np.any(isl >= 0):
+        node_island, n_isl = _node_islands(nodes)
+        icm = plt.get_cmap("tab10")
+        icol = [icm(i) for i in range(max(n_isl, 1))]
+        rgba_i = np.tile(np.array([0.85, 0.85, 0.85, 0.3]), (len(isl), 1))
+        for i in range(n_isl):
+            rgba_i[isl == i] = mcolors.to_rgba(icol[i])
+        legend_i = [Line2D([0], [0], marker="o", color="w", markerfacecolor=icol[i],
+                           markersize=8, label=f"island {i + 1}") for i in range(n_isl)]
+        node_color_i = {nid: icol[node_island[nid]] for nid in nodes}
+        bridge_color_i = {bi: (0.6, 0.6, 0.6, 1.0)
+                          for bi in range(len(_bridges(nodes)))}
+        panels.append(dict(kind="rgba", rgba=rgba_i, legend=legend_i, label="Hexmaze island",
+                           node_color=node_color_i, bridge_color=bridge_color_i))
+
     proj = [(0, 1, "UMAP 1", "UMAP 2"), (0, 2, "UMAP 1", "UMAP 3"),
             (1, 2, "UMAP 2", "UMAP 3")]
 
     with PdfPages(pdf_path) as pdf:
         # one 3D page per colour variable
-        for _key, c, cmap, label in panels:
+        for panel in panels:
             fig = plt.figure(figsize=(10, 8))
             ax = fig.add_subplot(111, projection="3d")
-            _scatter3d(ax, emb, c, cmap, label,
-                       f"Neural population UMAP — {res['quality']} "
-                       f"(n={res['n_units']} units)\ncoloured by {label}")
+            p = _panel_scatter(ax, emb[:, 0], emb[:, 1], panel, zs=emb[:, 2])
+            ax.set_title(f"Neural population UMAP — {res['quality']} "
+                         f"(n={res['n_units']} units)\ncoloured by {panel['label']}", fontsize=11)
+            ax.set_xlabel("UMAP 1"); ax.set_ylabel("UMAP 2"); ax.set_zlabel("UMAP 3")
+            if p is not None:
+                fig.colorbar(p, ax=ax, fraction=0.03, pad=0.08).set_label(panel["label"])
+            if panel.get("legend"):
+                ax.legend(handles=panel["legend"], fontsize=8, loc="upper right")
             fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-        # 2D-projection page per colour variable: UMAP1/2, UMAP1/3, UMAP2/3
-        for _key, c, cmap, label in panels:
-            fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+        # 2D-projection page per colour variable (+ a maze-key column for the hex/island
+        # panels so a coloured UMAP point can be matched to a maze location).
+        for panel in panels:
+            has_key = panel.get("node_color") is not None
+            ncol = 4 if has_key else 3
+            fig, axes = plt.subplots(1, ncol, figsize=(6 * ncol, 5.5))
             for ax, (i, j, xl, yl) in zip(axes, proj):
-                p = ax.scatter(emb[:, i], emb[:, j], c=c, cmap=cmap, s=4,
-                               alpha=0.7, linewidths=0, rasterized=True)
+                p = _panel_scatter(ax, emb[:, i], emb[:, j], panel)
                 ax.set_xlabel(xl); ax.set_ylabel(yl); ax.set_aspect("equal", "box")
-            fig.colorbar(p, ax=axes, fraction=0.02, pad=0.02).set_label(label)
-            fig.suptitle(f"UMAP 2D projections — {res['quality']} — coloured by {label}",
+            if p is not None:
+                fig.colorbar(p, ax=axes[:3], fraction=0.02, pad=0.02).set_label(panel["label"])
+            elif panel.get("legend"):
+                axes[0].legend(handles=panel["legend"], fontsize=8, loc="upper right")
+            if has_key:
+                _draw_maze_key(axes[3], nodes, panel["node_color"], panel["bridge_color"])
+            fig.suptitle(f"UMAP 2D projections — {res['quality']} — coloured by {panel['label']}",
                          fontsize=13)
             pdf.savefig(fig); plt.close(fig)
     print(f"  wrote {pdf_path}")
