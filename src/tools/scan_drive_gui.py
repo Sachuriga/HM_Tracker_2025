@@ -363,13 +363,14 @@ def flag_short_phases(res: dict, medians: dict) -> None:
 def search_all_drives(roots_selected: list[str], max_depth: int = 6,
                       include_system: bool = False,
                       on_dir=None, should_stop=None) -> dict:
-    """Hunt for Rat<N>/<YYYYMMDD> session folders across every mounted volume,
-    at any depth — not just directly under the selected drive roots.
+    """Hunt for Rat<N>/<YYYYMMDD> session folders WITHIN the selected drive folders,
+    at any depth (not just the structured 2-level layout the main scan reads). The
+    search is confined to the folders the user added — it does NOT walk other mounted
+    volumes.
 
-    Returns (rat_no, date8) -> list of dicts with the path, the volume it lives
-    on, whether it sits under one of the roots already selected in the GUI, and
-    what it contains. Use it to answer "the sheet says this session exists, it
-    isn't where I expected — so where did it end up?"."""
+    Returns (rat_no, date8) -> list of dicts with the path, the drive folder it lives
+    under, and what it contains. Use it to surface sessions filed somewhere odd
+    inside the drives, plus on-disk folders the sheet never asked for (orphans)."""
     selected = []
     for r in roots_selected:
         if r:
@@ -388,7 +389,7 @@ def search_all_drives(roots_selected: list[str], max_depth: int = 6,
         return False
 
     idx: dict = {}
-    for vol in sd.list_drive_roots(include_system=include_system):
+    for vol in selected:                       # only the drive folders the user added
         if should_stop is not None and should_stop():
             break
         for sess in sd.find_sessions_deep(vol, max_depth=max_depth,
@@ -652,7 +653,7 @@ class SearchWorker(QObject):
             # the other half of "find all the data".
             have_video = {k for k, hits in found.items()
                           if any(h.get("n_video", 0) for h in hits)}
-            vols = [str(v) for v in sd.list_drive_roots(include_system=self.include_system)]
+            vols = [r for r in self.roots if r]    # only the selected drive folders
             # include_filed=True: already-sorted camera folders are not re-filed,
             # but assign_videos needs them to hold their slot in the by-time
             # ordering so a still-loose folder gets the right session number.
@@ -2110,22 +2111,22 @@ class ScanDriveGUI(QMainWindow):
     def _search_all(self):
         if not self.roster:
             return
-        vols = sd.list_drive_roots(include_system=self.act_sysdrive.isChecked())
-        if not vols:
-            QMessageBox.warning(self, "No drives", "No mounted volumes to search.")
+        roots = self._drive_paths()
+        if not roots:
+            QMessageBox.warning(self, "No drive folders",
+                                "Add at least one drive folder above first.")
             return
         if QMessageBox.question(
-                self, "Search all drives",
-                f"Search {len(vols)} volume(s) — {', '.join(str(v) for v in vols)} — "
-                f"{self.depth_spin.value()} levels deep for Rat<N>/<YYYYMMDD> folders?\n\n"
-                "This walks the drives and may take a few minutes.") \
+                self, "Find scattered data",
+                f"Deep-search these {len(roots)} drive folder(s), "
+                f"{self.depth_spin.value()} levels down, for Rat<N>/<YYYYMMDD> folders:\n\n  "
+                + "\n  ".join(roots) + "\n\nThis may take a few minutes.") \
                 != QMessageBox.StandardButton.Yes:
             return
 
         self.search_btn.setEnabled(False)
         self.scan_btn.setEnabled(False)
-        self.status_lbl.setText("Searching all drives…")
-        roots = self._drive_paths()
+        self.status_lbl.setText("Searching the drive folders…")
 
         self.search_thread = QThread()
         self.search_worker = SearchWorker(self.roster, roots,
