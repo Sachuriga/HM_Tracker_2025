@@ -39,13 +39,13 @@ PRESETS = {
     "Tracker non-implanted": "23456d",
     "After manual curation": "wuvbm",
     "Retrack": "346d",
-    "Full pipeline": "1e234567c89wuvnbmst",
+    "Full pipeline": "1e234567c89wuvnbmt",
     "Trodes export (DIO/raw/analog + LFP)": "1e",
     "Sync + stitch + track": "234",
     "Spike sorting (+ continue)": "7c",
     "LFP + motion + EMG (sleep)": "e8",
     "NWB packaging (nwb + units + visualise)": "wuv",
-    "Analysis (decode / UMAP / summary)": "nbms",
+    "Analysis (decode / UMAP)": "nbm",
     "Drive scan (QC)": "t",
 }
 

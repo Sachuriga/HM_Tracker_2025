@@ -71,13 +71,12 @@ MENU = [
     ("v", "Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)"),
     ("b", "Bayesian position decoder + spikes/decoded-on-video overlays per session (good and good+mua)"),
     ("m", "Neural population UMAP per session (good & good+mua, all + pyramidal-only; Gardner et al. 2022)"),
-    ("s", "Session summary (cross-session per-animal plots by date/repeat/session)"),
     ("t", "Drive scan (videos playable + ephys has pre/task/post + non-zero .rec)"),
 ]
 
 # Sequential master-level steps, in execution order. Everything NOT in here is
 # a parallel worker step.
-SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u", "v", "b", "m", "s", "t"]
+SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u", "v", "b", "m", "t"]
 
 
 # ------------------------------------------------------------
@@ -590,6 +589,14 @@ def main():
                              if c not in SEQUENTIAL_STEPS and c != "6")
     parallel_trim = "".join(parallel_steps.split())
 
+    # Step [s] (cross-session summary) moved to the HM_Rat_Analysis repo. Without
+    # this notice a stale "s" would match no worker step and silently do nothing.
+    if "s" in selection:
+        print("[STEPS] Step [s] (session summary) now lives in the HM_Rat_Analysis "
+              "repo: python session_summary.py --root <folder>. Ignoring 's'.")
+        parallel_steps = parallel_steps.replace("s", "")
+        parallel_trim = parallel_trim.replace("s", "")
+
     # Scan ip* folders. Each ipN -> opN.
     ip_dirs = sorted(d for d in root.glob("ip*") if d.is_dir())
     if not ip_dirs:
@@ -785,17 +792,6 @@ def main():
             else:
                 print("[UMAP] neural_umap.py NOT found.")
         print(f"\n[MASTER] Neural-UMAP complete for all {total} folder(s).")
-
-    if has["s"]:
-        # cross-session aggregation over ALL NWBs under the root (one call, not per-op)
-        print("\n" + "=" * 56)
-        print("[MASTER] Running SESSION-SUMMARY (cross-session per-animal plots)...")
-        print("=" * 56)
-        if Path("./src/nwb/session_summary.py").exists():
-            rc = run([PYTHON, "-u", "./src/nwb/session_summary.py", "--root", root, "--config", config])
-            print("[SUMMARY] Done." if rc == 0 else "[SUMMARY] Python exited with error.")
-        else:
-            print("[SUMMARY] session_summary.py NOT found.")
 
     if has["t"]:
         # raw-drive integrity scan over the whole root (one call, not per-op)
