@@ -386,7 +386,41 @@ def read_goal_node(session_dir):
     return read_recording_meta(session_dir).get("Goal_Node")
 
 # creates a DynamicTable from a pandas DataFrame
-def create_trials_table(df, table_name, description, goal_node=None, session_scalars=None):
+def trial_windows_on_position_clock(df_coords):
+    """{trial_num: (start_s, end_s)} on the POSITION clock, from the coordinate file.
+
+    The trial times parsed out of the tracker .txt are "Sync Seconds": a
+    behavioural-sync clock that is offset from, and drifts against, the video clock
+    the positions and spikes live on. Worse, the .txt writes that field as a unix
+    float in some sessions and as HH:MM:SS in others, so process_txt returns two
+    incompatible scales (see parse_time). Neither can be compared with
+    Position.timestamps.
+
+    The coordinate file already carries Trial_Num per frame alongside the frame's
+    position timestamp, so the trial boundaries can be read straight off the same
+    clock the positions use. That is what plot_trials and visualize_nwb do, and it
+    is the only derivation that lines up for every session.
+
+    Returns {} if the coordinate file lacks the columns.
+    """
+    if df_coords is None:
+        return {}
+    cols = set(df_coords.columns)
+    tcol = next((c for c in ("Time (seconds)", "Timestamp") if c in cols), None)
+    if "Trial_Num" not in cols or tcol is None:
+        return {}
+    tnum = pd.to_numeric(df_coords["Trial_Num"], errors="coerce")
+    secs = pd.to_numeric(df_coords[tcol], errors="coerce")
+    ok = tnum.notna() & secs.notna()
+    out = {}
+    for k, grp in secs[ok].groupby(tnum[ok]):
+        if len(grp):
+            out[int(k)] = (float(grp.min()), float(grp.max()))
+    return out
+
+
+def create_trials_table(df, table_name, description, goal_node=None, session_scalars=None,
+                        position_clock_windows=None):
     """
     Converts a pandas DataFrame to a DynamicTable for NWB storage.
 
@@ -429,6 +463,37 @@ def create_trials_table(df, table_name, description, goal_node=None, session_sca
             description=f"Session-level {name} from RecordingMeta.xlsx",
             data=np.array([str(val).encode()] * len(df), dtype=object),
         ))
+
+    # Trial start/end on the POSITION clock. Trial_start_time / Trial_end_time above
+    # come from the .txt "Sync Seconds" field and are NOT comparable with
+    # Position.timestamps — they arrive as unix floats in some sessions and as
+    # seconds-since-midnight in others. These two columns are the ones any spatial
+    # analysis should use.
+    if position_clock_windows and "Trial_Num" in df.columns:
+        tn = pd.to_numeric(df["Trial_Num"], errors="coerce")
+        starts = np.array([position_clock_windows.get(int(v), (np.nan, np.nan))[0]
+                           if pd.notna(v) else np.nan for v in tn], dtype=float)
+        ends = np.array([position_clock_windows.get(int(v), (np.nan, np.nan))[1]
+                         if pd.notna(v) else np.nan for v in tn], dtype=float)
+        n_ok = int(np.isfinite(starts).sum())
+        print(f"  trials table: {n_ok}/{len(df)} rows given position-clock times "
+              f"({len(position_clock_windows)} trials matched from the coordinate file)")
+        columns.append(VectorData(
+            name="Trial_start_s",
+            description="Trial start, seconds on the Position/spike clock "
+                        "(from the coordinate file's Trial_Num blocks). Use this, "
+                        "not Trial_start_time, for anything spatial.",
+            data=starts))
+        columns.append(VectorData(
+            name="Trial_end_s",
+            description="Trial end, seconds on the Position/spike clock "
+                        "(from the coordinate file's Trial_Num blocks). Use this, "
+                        "not Trial_end_time, for anything spatial.",
+            data=ends))
+    else:
+        print("  WARNING: no position-clock trial times available; Trials_Data will "
+              "carry only the .txt sync-clock times, which do not align with "
+              "Position.timestamps.")
 
     table = DynamicTable(
         name=table_name,
@@ -791,12 +856,18 @@ if __name__ == "__main__":
 
         # create trials table from txt data
         if df_txt is not None:
+            # trial windows read off the same clock the positions use — the .txt
+            # "Sync Seconds" cannot be compared with Position.timestamps
+            pos_windows = trial_windows_on_position_clock(df)
+            if not pos_windows:
+                pos_windows = trial_windows_on_position_clock(df_coordinates_with_frames)
             trials_table = create_trials_table(
                 df_txt,
                 table_name,
                 table_description,
                 goal_node,
                 session_scalars=session_scalars,
+                position_clock_windows=pos_windows,
             )
 
         # add trials table to behavior module

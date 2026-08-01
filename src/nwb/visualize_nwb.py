@@ -20,8 +20,15 @@ and writes PDFs into <op>/visualization/:
     page 1  - spike amplitude vs time, mean waveform template, and a text panel
               labelling the unit pyramidal / interneuron with its key stats
     page 2+ - rate map (full duration); rate map of each of the 24 trials; rate
-              map of each type-4 trial; rate maps before and after the 2nd
+              map of each type-4 trial; a map of the time BETWEEN trials built
+              from the RESEARCHER position (the rat is carried then, so its own
+              tracker holds one position); rate maps before and after the 2nd
               special (type-4/5) trial
+
+  On every spike-on-path panel the trajectory is broken at teleports and at time
+  gaps, so trials are never joined by a line the animal did not walk, and spikes
+  are jittered in proportion to the local firing rate (SPIKE_JITTER_M) so a place
+  field reads as a cloud instead of a pile of overlapping dots.
 
 Cell-type rule (good units only):
     firing rate > 10 Hz                        -> interneuron
@@ -68,6 +75,11 @@ SCALE_X = 2352 / 2 / 9
 SCALE_Y = 1424 / 2 / 5
 MAZE_EXTENT = (0.0, 9.0, 0.0, 5.0)
 
+# Spikes on the path are displaced by a Gaussian scaled to the local firing rate,
+# so a place field reads as a cloud rather than as an unreadable pile of dots on
+# one stretch of trajectory. Metres at the cell's peak rate; 0 disables it.
+SPIKE_JITTER_M = 0.06
+
 
 # ------------------------------------------------------------
 #                 locating inputs
@@ -104,23 +116,104 @@ def _read_phy_params(phy_folder):
 # ------------------------------------------------------------
 #                 loading NWB content
 # ------------------------------------------------------------
-def load_position(nwb):
-    """Return (x, y, t) for the animal in session-relative seconds, or None."""
+def load_position(nwb, series=None):
+    """Return (x, y, t) in session-relative seconds for one tracked body, or None.
+
+    `series` picks a named SpatialSeries ('Rat', 'Researcher', ...); the default
+    keeps the historical behaviour of preferring 'Rat' and falling back to the
+    first series present.
+    """
     try:
         pos = nwb.processing["Behavior"]["Position"]
     except Exception:
         return None
     ss = pos.spatial_series
-    # Prefer a series literally named 'Rat'; else the first one.
-    key = "Rat" if "Rat" in ss else next(iter(ss), None)
+    if series is not None:
+        if series not in ss:
+            return None
+        key = series
+    else:
+        # Prefer a series literally named 'Rat'; else the first one.
+        key = "Rat" if "Rat" in ss else next(iter(ss), None)
     if key is None:
         return None
     s = ss[key]
     xy = np.asarray(s.data[:], dtype=float)
     t = np.asarray(s.timestamps[:], dtype=float)
+    if xy.ndim != 2 or xy.shape[1] < 2 or not np.isfinite(xy).any():
+        return None
     x, y = xy[:, 0], xy[:, 1]
     order = np.argsort(t)
     return x[order], y[order], t[order]
+
+
+def inter_trial_windows(trials, t_min, t_max, min_gap_s=3.0):
+    """The [t0, t1] windows BETWEEN trials — when the rat is out of the maze.
+
+    The animal is carried back to the next start island between trials, so its own
+    tracker holds one position for the whole gap. The researcher IS tracked then,
+    which is what makes an inter-trial map possible at all.
+
+    Includes the lead-in before the first trial and the tail after the last one.
+    Gaps shorter than `min_gap_s` are dropped as trial-boundary jitter.
+    """
+    spans = sorted((float(t0), float(t1)) for (_tt, _g, _s, t0, t1) in trials)
+    gaps, prev = [], float(t_min)
+    for a, b in spans:
+        if a - prev >= min_gap_s:
+            gaps.append((prev, a))
+        prev = max(prev, b)
+    if float(t_max) - prev >= min_gap_s:
+        gaps.append((prev, float(t_max)))
+    return gaps
+
+
+def fill_short_gaps(x, y, t, max_gap_s=0.10):
+    """Interpolate across brief tracking dropouts, leaving long ones as NaN.
+
+    The Researcher series drops roughly one frame in six, so its longest unbroken
+    run is ~5 frames. Anything that segments on NaN then sees only 0.17 s
+    fragments: smoothing windows never fill, speed is computed across the holes,
+    and a researcher standing still for half a minute looks like constant motion.
+    Bridging only the short holes restores the real runs without inventing data
+    across a genuine loss of tracking.
+    """
+    x = np.asarray(x, float).copy()
+    y = np.asarray(y, float).copy()
+    t = np.asarray(t, float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    if ok.sum() < 2 or ok.all():
+        return x, y
+    idx = np.flatnonzero(ok)
+    # only bridge holes whose surrounding tracked samples are close in time
+    fillable = np.zeros(len(x), dtype=bool)
+    for a, b in zip(idx[:-1], idx[1:]):
+        if b - a > 1 and (t[b] - t[a]) <= max_gap_s:
+            fillable[a + 1:b] = True
+    if fillable.any():
+        x[fillable] = np.interp(t[fillable], t[ok], x[ok])
+        y[fillable] = np.interp(t[fillable], t[ok], y[ok])
+    return x, y
+
+
+def concat_windows(x, y, t, windows, fill_gaps_s=0.10):
+    """Samples falling inside any of `windows`, concatenated in time order.
+
+    Rate maps over several disjoint windows are built from this. Short tracking
+    dropouts are bridged first (see fill_short_gaps); speed at a window junction is
+    computed across the seam and so is meaningless, but that is one sample per
+    window out of thousands.
+    """
+    if not windows:
+        return None
+    if fill_gaps_s:
+        x, y = fill_short_gaps(x, y, t, fill_gaps_s)
+    m = np.zeros(len(t), dtype=bool)
+    for a, b in windows:
+        m |= (t >= a) & (t <= b)
+    if m.sum() < 2:
+        return None
+    return x[m], y[m], t[m]
 
 
 def _pick_file(op, pat):
@@ -645,12 +738,52 @@ def _mark_goal_start(ax, goal_xy, start_xy):
                    linewidths=1.8, zorder=5, label="start")
 
 
+def break_path(x, y, t, max_step_m=0.45, max_gap_s=1.0):
+    """Trajectory with NaN inserted wherever it should not be drawn as one line.
+
+    Two things break it: a tracking teleport (a step no rat could make), and a time
+    gap. Without this a single ax.plot joins the end of one trial to the start of
+    the next — the rat was carried between them, so the straight line it draws
+    across the maze is not a path the animal ever took.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    t = np.asarray(t, float)
+    if x.size < 2:
+        return x, y
+    cut = np.flatnonzero((np.hypot(np.diff(x), np.diff(y)) > max_step_m)
+                         | (np.diff(t) > max_gap_s)) + 1
+    return np.insert(x, cut, np.nan), np.insert(y, cut, np.nan)
+
+
+def _rate_at(rate, extent, px, py):
+    """Rate-map value under each point, as a fraction of the map's peak."""
+    if rate is None or not np.ma.count(rate):
+        return np.zeros(len(px))
+    filled = rate.filled(0.0) if np.ma.isMaskedArray(rate) else np.asarray(rate)
+    peak = float(filled.max())
+    if peak <= 0:
+        return np.zeros(len(px))
+    ny, nx = filled.shape
+    x0, x1, y0, y1 = extent
+    ix = np.clip(((px - x0) / (x1 - x0) * nx).astype(int), 0, nx - 1)
+    iy = np.clip(((py - y0) / (y1 - y0) * ny).astype(int), 0, ny - 1)
+    return filled[iy, ix] / peak
+
+
 def plot_spike_path(ax, x, y, t, spike_times, title, extent, t0=None, t1=None,
-                    goal_xy=None, start_xy=None, nodes=None):
+                    goal_xy=None, start_xy=None, nodes=None,
+                    rate=None, jitter_m=0.0, rng=None):
     """Classic spike-on-trajectory plot: grey path + red spikes at the animal's
     position when each spike occurred. Restricted to [t0,t1] when given. All panels
     share `extent`. `nodes` draws the faint hexmaze behind; `goal_xy` marks the goal
-    node (gold star) and `start_xy` the trial's start node (green ring)."""
+    node (gold star) and `start_xy` the trial's start node (green ring).
+
+    With `rate` and `jitter_m`, each spike is displaced by a Gaussian whose width
+    scales with the local firing rate, so where the cell fires hardest the spikes
+    bloom into a cloud instead of piling onto the same centimetre of path. The
+    displacement is cosmetic — it never touches the rate map or any metric.
+    """
     ax.set_xticks([]); ax.set_yticks([])
     ax.set_aspect("equal")
     ax.set_xlim(extent[0], extent[1])
@@ -666,10 +799,18 @@ def plot_spike_path(ax, x, y, t, spike_times, title, extent, t0=None, t1=None,
         ax.set_title(title, fontsize=8)
         _mark_goal_start(ax, goal_xy, start_xy)
         return
-    ax.plot(x, y, color="0.5", lw=0.4, zorder=1)
+    bx, by = break_path(x, y, t)
+    ax.plot(bx, by, color="0.5", lw=0.4, zorder=1)
     if spike_times.size:
         sx = np.interp(spike_times, t, x, left=np.nan, right=np.nan)
         sy = np.interp(spike_times, t, y, left=np.nan, right=np.nan)
+        if jitter_m > 0 and rate is not None:
+            ok = np.isfinite(sx) & np.isfinite(sy)
+            if ok.any():
+                rng = np.random.default_rng(0) if rng is None else rng
+                sigma = jitter_m * _rate_at(rate, extent, sx[ok], sy[ok])
+                sx[ok] = sx[ok] + rng.normal(0, 1, ok.sum()) * sigma
+                sy[ok] = sy[ok] + rng.normal(0, 1, ok.sum()) * sigma
         ax.scatter(sx, sy, s=4, c="red", alpha=0.5, edgecolors="none", zorder=2)
     _mark_goal_start(ax, goal_xy, start_xy)
     ax.set_title(f"{title}\n{int(spike_times.size)} spk", fontsize=8)
@@ -706,6 +847,19 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
             # to metres in the plot_trials frame (px / SCALE), so bins are physical
             _px, _py, _t = pos
             pos = (_px / SCALE_X, _py / SCALE_Y, _t)
+
+        # Between trials the rat is carried out of the maze, so its own tracker
+        # holds a single position for the whole gap. The researcher is tracked
+        # then, so an inter-trial map is built from that series instead.
+        res_pos = load_position(nwb, series="Researcher")
+        if res_pos is not None:
+            _rx, _ry, _rt = res_pos
+            res_pos = (_rx / SCALE_X, _ry / SCALE_Y, _rt)
+            _finite = int(np.isfinite(res_pos[0]).sum())
+            print(f"  researcher series: {_finite} tracked samples "
+                  f"({100 * _finite / max(len(res_pos[0]), 1):.0f}%)")
+        else:
+            print("  no 'Researcher' series — inter-trial maps will be skipped.")
         # firing rate + classification for every unit
         extent = MAZE_EXTENT                       # fixed metre frame (0..9, 0..5)
         bin_m = bin_cm / 100.0
@@ -778,6 +932,16 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
             trials = []
         nodes = load_nodes()   # maze-node coords (metres) to mark the goal node
 
+        # windows between trials, for the researcher-position maps
+        gaps = inter_trial_windows(trials, float(t.min()), float(t.max())) \
+            if (pos is not None and trials) else []
+        if gaps and res_pos is not None:
+            _g = concat_windows(*res_pos, gaps)
+            _n = 0 if _g is None else int(np.isfinite(_g[0]).sum())
+            print(f"  {len(gaps)} inter-trial gap(s), "
+                  f"{sum(b - a for a, b in gaps):.0f} s; researcher tracked in "
+                  f"{_n * (dt if _n else 0):.0f} s of them")
+
         pfx = file_prefix(output_folder)               # rat_sessiondate_ prefix
 
         # ---- summary.pdf ----
@@ -790,7 +954,8 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
             wf = np.asarray(row["waveform_mean"]) if has_wf else None
             amp_t, amp_v = load_amplitudes(phy, cid) if phy is not None else (None, None)
             _write_unit_pdf(out_dir / f"{pfx}Unit_{cid}.pdf", row, cid, spike_times, wf,
-                            amp_t, amp_v, pos, extent, bins, dt, sigma, speed, trials, nodes)
+                            amp_t, amp_v, pos, extent, bins, dt, sigma, speed, trials, nodes,
+                            res_pos=res_pos, gaps=gaps)
         print(f"  Wrote {pfx}summary.pdf + {len(good)} unit PDF(s) to {out_dir}")
     finally:
         io.close()
@@ -945,7 +1110,8 @@ def _pyramidal_epochs(trials, t):
 
 
 def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
-                    pos, extent, bins, dt, sigma, speed, trials, nodes):
+                    pos, extent, bins, dt, sigma, speed, trials, nodes,
+                    res_pos=None, gaps=None):
     # Place-field metrics (pyramidal cells only), split before/after a type-5
     # goal-switch free-roaming trial when present.
     pf_lines = []
@@ -1064,6 +1230,19 @@ def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
                           t0=t0, t1=t1, vmax=unit_vmax,
                           goal_xy=nodes.get(gn), start_xy=nodes.get(sn), nodes=nodes)
 
+        # ---- between trials, from the RESEARCHER position ----
+        # The rat's own tracker holds one position while it is carried between
+        # islands, so its map would be a single bin. The researcher is tracked
+        # then, and carries the rat, so this is where the animal actually was.
+        if res_pos is not None and gaps:
+            sel = concat_windows(*res_pos, gaps)
+            if sel is not None:
+                rx, ry, rt = sel
+                _spatial_page(pdf, rx, ry, rt, spike_times, extent, bins, dt, sigma, speed,
+                              f"Unit {cid} — between trials (researcher position, "
+                              f"{len(gaps)} gaps, {sum(b - a for a, b in gaps):.0f} s)",
+                              vmax=unit_vmax, nodes=nodes)
+
         # rate map before / after the 2nd free-roaming trial (spatial remapping)
         if len(specials) >= 2:
             _tt2, g2, _sn2, s0, s1 = specials[1]
@@ -1089,17 +1268,21 @@ def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
 
 def _spatial_page(pdf, x, y, t, spike_times, extent, bins, dt, sigma, speed,
                   title, t0=None, t1=None, vmax=None, goal_xy=None, start_xy=None,
-                  nodes=None):
+                  nodes=None, jitter_m=SPIKE_JITTER_M):
     """One portrait PDF page: spike-on-path on top, rate map below. `nodes` draws
     the faint hexmaze behind both; `goal_xy`/`start_xy` mark the trial's goal (gold
-    star) and start node (green ring) on both panels."""
+    star) and start node (green ring) on both panels.
+
+    The rate map is computed first so the spike panel can use it to scale each
+    spike's jitter (see plot_spike_path)."""
     fig, (axp, axr) = plt.subplots(2, 1, figsize=(8.27, 11.69))   # A4 portrait
-    plot_spike_path(axp, x, y, t, spike_times, "spikes on path", extent,
-                    t0=t0, t1=t1, goal_xy=goal_xy, start_xy=start_xy, nodes=nodes)
-    if axp.get_legend_handles_labels()[1]:
-        axp.legend(fontsize=6, loc="upper right", framealpha=0.6)
     rate, ext = make_rate_map(x, y, t, spike_times, extent, bins, dt, sigma,
                               t0=t0, t1=t1, speed_thresh=speed)
+    plot_spike_path(axp, x, y, t, spike_times, "spikes on path", extent,
+                    t0=t0, t1=t1, goal_xy=goal_xy, start_xy=start_xy, nodes=nodes,
+                    rate=rate, jitter_m=jitter_m)
+    if axp.get_legend_handles_labels()[1]:
+        axp.legend(fontsize=6, loc="upper right", framealpha=0.6)
     im = _draw_map(axr, rate, ext, "rate map", vmax=vmax, nodes=nodes)
     _mark_goal_start(axr, goal_xy, start_xy)
     if im is not None:
