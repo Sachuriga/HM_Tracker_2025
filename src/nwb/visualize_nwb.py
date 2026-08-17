@@ -819,7 +819,8 @@ def plot_spike_path(ax, x, y, t, spike_times, title, extent, t0=None, t1=None,
 # ------------------------------------------------------------
 #                 the visualiser
 # ------------------------------------------------------------
-def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
+def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05,
+              theta_events=True, units_sel=None):
     nwb_path = find_nwb_file(output_folder)
     if nwb_path is None:
         print(f"No .nwb under '{output_folder}' (run steps w/u first). Skipping.")
@@ -932,6 +933,16 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
             trials = []
         nodes = load_nodes()   # maze-node coords (metres) to mark the goal node
 
+        # per-unit event PETHs + theta phase/precession pages (theta_events.py):
+        # session-wide inputs (events, theta phase) prepared ONCE here.
+        te_bundle = None
+        if theta_events and pos is not None and trials:
+            try:
+                import theta_events as TE
+                te_bundle = TE.prepare(output_folder, x, y, t, trials, nodes)
+            except Exception as e:
+                print(f"  [theta-events] preparation failed ({e}); pages skipped.")
+
         # windows between trials, for the researcher-position maps
         gaps = inter_trial_windows(trials, float(t.min()), float(t.max())) \
             if (pos is not None and trials) else []
@@ -948,15 +959,19 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
         _write_summary(out_dir / f"{pfx}summary.pdf", udf, good, pos, extent, bins, dt, sigma, speed, nwb, nodes)
 
         # ---- one PDF per good unit ----
+        n_written = 0
         for uid, row in good.iterrows():
             cid = int(row["phy_cluster_id"]) if "phy_cluster_id" in row else int(uid)
+            if units_sel and cid not in units_sel:
+                continue
             spike_times = np.asarray(row["spike_times"], dtype=float)
             wf = np.asarray(row["waveform_mean"]) if has_wf else None
             amp_t, amp_v = load_amplitudes(phy, cid) if phy is not None else (None, None)
             _write_unit_pdf(out_dir / f"{pfx}Unit_{cid}.pdf", row, cid, spike_times, wf,
                             amp_t, amp_v, pos, extent, bins, dt, sigma, speed, trials, nodes,
-                            res_pos=res_pos, gaps=gaps)
-        print(f"  Wrote {pfx}summary.pdf + {len(good)} unit PDF(s) to {out_dir}")
+                            res_pos=res_pos, gaps=gaps, te_bundle=te_bundle)
+            n_written += 1
+        print(f"  Wrote {pfx}summary.pdf + {n_written} unit PDF(s) to {out_dir}")
     finally:
         io.close()
 
@@ -1111,7 +1126,7 @@ def _pyramidal_epochs(trials, t):
 
 def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
                     pos, extent, bins, dt, sigma, speed, trials, nodes,
-                    res_pos=None, gaps=None):
+                    res_pos=None, gaps=None, te_bundle=None):
     # Place-field metrics (pyramidal cells only), split before/after a type-5
     # goal-switch free-roaming trial when present.
     pf_lines = []
@@ -1265,6 +1280,15 @@ def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
         color = "tab:blue" if row.get("cell_type") == "pyramidal" else "tab:cyan"
         _speed_page(pdf, x, y, t, spike_times, dt, speed_windows, cid, color)
 
+        # ---- event PETH/raster + theta phase coupling + phase precession pages,
+        #      split goal-running / free-roaming / all (theta_events.py) ----
+        if te_bundle is not None:
+            try:
+                import theta_events as TE
+                TE.unit_pages(pdf, cid, spike_times, te_bundle)
+            except Exception as e:
+                print(f"  [theta-events] unit {cid} pages failed ({e}).")
+
 
 def _spatial_page(pdf, x, y, t, spike_times, extent, bins, dt, sigma, speed,
                   title, t0=None, t1=None, vmax=None, goal_xy=None, start_xy=None,
@@ -1315,10 +1339,16 @@ if __name__ == "__main__":
     parser.add_argument("--speed", type=float, default=0.05,
                         help="Speed gate in m/s: only samples/spikes above this count toward "
                              "occupancy/rate maps (0 = no gating).")
+    parser.add_argument("--units", type=int, nargs="+", default=None,
+                        help="only write PDFs for these phy cluster ids (default: all good).")
+    parser.add_argument("--no_theta_events", action="store_true",
+                        help="skip the event-PETH / theta-phase / precession pages.")
     args = parser.parse_args()
 
     try:
-        visualize(args.output_folder, bin_cm=args.bin_cm, sigma=args.smooth, speed=args.speed)
+        visualize(args.output_folder, bin_cm=args.bin_cm, sigma=args.smooth, speed=args.speed,
+                  theta_events=not args.no_theta_events,
+                  units_sel=set(args.units) if args.units else None)
     except Exception as e:
         print(f"[viz] Failed: {e}")
         traceback.print_exc()
