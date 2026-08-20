@@ -210,7 +210,7 @@ data_root/
 ```
 
 - **Parallel steps** (`1 e 2 3 4 5 8 d n`) process each `ipN → opN` pair in its own worker.
-- **Sequential steps** (`7 c r 9 w u v b m t`) run at master level, one folder at a time, after all workers finish. Steps c/r/u/v/b/m also accept **session-date folders** (`YYYYMMDD/` whose name appears in a file inside them) as targets — the layout used on the processed network share.
+- **Sequential steps** (`7 c r 9 w u v b m t`) run at master level after all workers finish — steps `7 c r 9 u v b m` loop one folder at a time; steps `w` and `t` run **once over the whole root**. Steps c/r/u/v/b/m also accept **session-date folders** (`YYYYMMDD/` whose name appears in a file inside them) as targets — the layout used on the processed network share.
 - **Step 6** (compression) is always pulled out and runs **last**, over every top-level `.mp4` of every `op*` folder.
 
 ---
@@ -269,8 +269,8 @@ The interactive menu:
 [w] nwblfp (NWB / LFP package)
 [u] Add curated Units (metrics + waveforms) to NWB (runs after w)
 [v] Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)
-[b] Bayesian position decoder + spikes/decoded-on-video overlays (good and good+mua)
-[m] Neural population UMAP (good & good+mua, all + pyramidal-only; Gardner et al. 2022)
+[b] Bayesian position decoder + spikes/decoded-on-video overlays per session (good and good+mua)
+[m] Neural population UMAP per session (good & good+mua, all + pyramidal-only; Gardner et al. 2022)
 [t] Drive scan (videos playable + ephys has pre/task/post + non-zero .rec)
 ```
 
@@ -545,7 +545,7 @@ Discovers session folders (`op*` or `YYYYMMDD`-named) and packages each into `<o
 
 **Script:** `src/nwb/add_units.py --output_folder <op> [--n_jobs 4] [--skip-waveforms]`
 
-Appends the curated Phy units into the session NWB (in place). Templates are **always recomputed** from `phy_export/recording.dat` (cached/stale template files are never trusted). Units columns: `spike_times` (seconds, position clock), `waveform_mean`, `phy_cluster_id`, `sorting_group`, **`quality_label`** (manual Phy `cluster_group.tsv` — the human truth), **`auto_quality_label`** (automated), all curated metric CSV columns, plus recomputed `firing_rate_hz`, `trough_to_peak_s`, `peak_half_width_s`, `trough_half_width_s`, `acg_tau_rise_ms`, and **`cell_type`**.
+Appends the curated Phy units into the session NWB (in place). Templates are **always recomputed** from the recording referenced by `phy_export/params.py` (`dat_path` → `processed_binary/`, since the export uses `copy_binary=False`); cached/stale template files are never trusted. Units columns: `spike_times` (seconds, position clock), `waveform_mean`, `phy_cluster_id`, `sorting_group`, **`quality_label`** (manual Phy `cluster_group.tsv` — the human truth), **`auto_quality_label`** (automated), all curated metric CSV columns, plus recomputed `firing_rate_hz`, `trough_to_peak_s`, `peak_half_width_s`, `trough_half_width_s`, `acg_tau_rise_ms`, and **`cell_type`**.
 
 **Cell-type rule** (`src/nwb/spike_metrics.py`, CellExplorer + FR gate): *interneuron* if FR > 10 Hz, OR trough-to-peak ≤ 0.425 ms (narrow), OR (trough-to-peak > 0.425 ms AND ACG τ_rise > 6 ms, wide); else *pyramidal*.
 
@@ -593,7 +593,7 @@ Runs per session for **both** quality sets `good` and `good+mua`:
 3. **`src/nwb/predictive_coding.py`** — is a long-lead "prediction" genuine or just behavioural autocorrelation/goal occupancy? Four pages into `<op>/predictive_coding/`: cross-validated neural error vs *persistence*, *constant-velocity* and *behaviour-only* baselines + a spike-shuffle null band (over moving bins); overshoot vs distance-to-goal; decoded-density maps neural vs shuffle; goal-switch density (or a note when the session has a single fixed goal).
 4. Once per op: **`make_videos.py --which spikes --quality good`** — per goal trial, the top-20 good pyramidal cells by spatial information, spikes (speed-gated, jet-coloured per unit, FR-ranked perpendicular jitter) accumulated on the real video.
 
-All make_videos options: `--n_units 20 --leads 0 1 2 3 --exclude_types 4 5 --trials N.. --stride N --fps/hold/speed knobs --no_jitter --fr_offset_px 15 --speed_thresh 0.05`.
+make_videos options: `--which spikes|decoded|both`, `--n_units 20`, `--leads 0 1 2 3`, `--quality good [mua]`, `--exclude_types 4 5`, `--trials N..`, `--stride N` (keep every Nth frame; output fps = source fps / N — fps itself comes from the source video), `--hold_s 0.6`, `--bin_cm 10`, `--time_bin 0.5`, `--no_jitter`, `--fr_offset_px 15`, `--speed_thresh 0.05`.
 
 > The visualisation track (`decoded_*.npz`) is deliberately in-sample (smooth); quote accuracy only from the cross-validated `decode_leads_*.pdf` / `leads_summary_*.npz`.
 
@@ -680,7 +680,7 @@ Every frame is passed through YOLOv11 at confidence threshold 0.7 and input size
 
 | Class | Used for |
 |---|---|
-| `head` | Counted only (`Rat-head Count` overlay); does not affect position |
+| `head` | Boxes drawn (cached) only; not counted, does not affect position |
 | `rat` | Position tracking — the body centroid drives all trial logic |
 | `researcher` | Trial-trigger and force-end logic |
 
@@ -717,20 +717,20 @@ INTER-TRIAL  (start_trial=False, record_detections=False)
 
 **Researcher-proximity end** — applies to **all** trial types: the trial ends when the closest researcher comes within 150 px of the rat, but only once *armed* (the researcher must first have been >150 px away during the trial) and only after a per-type minimum time — 5 s for types 1/2, 10 min for types 3–6. Suppressed in schedule-only end mode.
 
-**`Did_Not_Reach` trials** — for trials flagged `Did_Not_Reach=1` in the metadata, the goal-reach end is disabled; the trial ends when the researcher stays ≤ 60 px from the rat for a cumulative 1 s ("rat picked up").
+**`Did_Not_Reach` trials** — the column is read, but it currently has **no effect on trial ending**: an intended "rat picked up" end (researcher ≤ 60 px for a cumulative 1 s, goal-reach disabled) exists only in a shadowed duplicate of `object_detection` and never runs — the goal-reach end still fires for DNR trials.
 
 **Force-end fallbacks:**
 
 - Closest researcher to the **goal** within 50 px for 10 continuous seconds → trial ends.
 - Closest researcher to the **goal** within 160 px for 30 continuous seconds → trial ends (probe immunity and unnormal-interval rules apply).
 
-**Unnormal intervals** — Time windows in the `Unnormal_Intervals` column (`trial_num:start_min-end_min`) suppress goal-reach and force-end checks during that window.
+**Unnormal intervals** — Time windows in the `Unnormal_Intervals` column (`trial_num:start_min-end_min`) suppress the goal-reach ends and the 160 px/30 s researcher-at-goal force-end during the window. The 50 px/10 s force-end and the researcher-near-rat end still fire.
 
 **Inter-trial lockout** — After a type-4/5/6 trial, the next trial cannot start until 10 minutes have elapsed **from the start of the special trial**. A countdown overlay shows the remaining time; the researcher-proximity trigger is blocked until the lockout expires.
 
 #### Time-locked special trials
 
-A row's `Special_Trials` cell can specify when a trial unlocks: `trial_num@MM:SS` (e.g. `3@5:30`; **format the cell as Text** or Excel eats the trial number). The schedule check runs every frame before any other trial logic.
+A row's `Special_Trials` cell can specify when a trial unlocks: `trial_num@MM:SS` (e.g. `3@5:30`; **format the cell as Text** or Excel eats the trial number). The schedule check runs once per frame after the detection/trial-state logic, and only while a trial is active.
 
 | Phase | Behavior |
 |---|---|
@@ -738,7 +738,7 @@ A row's `Special_Trials` cell can specify when a trial unlocks: `trial_num@MM:SS
 | Unlock time arrives, earlier trial still active | The earlier trial is force-ended (`"forced by special trial schedule"`). |
 | After force-end | `start_trial` is armed directly (TrigA/TrigB bypassed); the type-4/5/6 lockout is still enforced. |
 
-**Schedule-only end mode.** When a trial's *next* trial number is in the schedule, every other end path for the current trial (NGL timeout, researcher-near-rat, researcher-at-goal timers, unnormal-interval timeout) is suppressed — only the schedule force-end can terminate it.
+**Schedule-only end mode.** When a trial's *next* trial number is in the schedule, four end paths for the current trial are suppressed (NGL timeout, researcher-near-rat, researcher-at-goal timers, unnormal-interval timeout) so the schedule force-end can take over. The plain goal-reach end (type 1) and the probe-complete end are **not** suppressed and can still finish the trial early.
 
 **Scheduled-trial minimum duration** — a trial started by schedule blocks all end triggers for its first 5 seconds.
 
@@ -836,7 +836,7 @@ Computed from the last bridge crossing into the goal island (a step where consec
 
 | Column | Description |
 |---|---|
-| `isl_node_in` | Node at last entry into the goal island |
+| `isl_node_in` | Node on the DEPARTURE side of the last island crossing (the node before the ≥50-id jump); entry metrics are measured from it |
 | `isl_short_path` | `node_graph_distance(isl_node_in, goal) + 1` |
 | `isl_dt_trav` | Nodes from island entry to end of path |
 | `perf_in_island` | `isl_dt_trav / isl_short_path` |
@@ -853,12 +853,12 @@ Per-session and per-trial input for the tracker (template: `examples/RecordingMe
 | `Num_Trials` | Total trials in the session |
 | `Start_Min` / `Start_Sec` | Optional: start the video at this offset |
 | `Stop_Min` / `Stop_Sec` | Optional: stop processing at this offset |
-| `Start_At_Trial_Num` | Optional: resume from this trial number |
+| `Start_At_Trial_Num` | Optional; only takes effect together with `Start_Min`/`Start_Sec`, and only relabels the trial number — start/goal/type rows are NOT skipped ahead |
 | `Start_Nodes` / `Goal_Node` | Per-row start / goal node IDs |
 | `Trial_Type` | Per-row trial type (1–6) |
 | `Special_Trials` | `3` or time-locked `trial_num@MM:SS` start schedule (**cell must be Text**) |
 | `Special_Trials_End` | `trial_num@MM:SS` termination locks: no end path fires before the time, force-end at it (**cell must be Text**) |
-| `Did_Not_Reach` | `1` disables the goal-reach end; the trial ends by researcher pickup (≤ 60 px for 1 s cumulative) |
+| `Did_Not_Reach` | Read by the tracker but currently has **no effect** on trial ending (the intended pickup-end is dead code — see Tracker section) |
 | `Unnormal_Intervals` | Immunity windows per trial (`trial:start_min-end_min`) |
 
 ---
