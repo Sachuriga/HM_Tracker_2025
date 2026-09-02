@@ -36,6 +36,7 @@ A batch-processing pipeline for rat hexmaze neuroscience experiments — from ra
    - [Step 8 — LFP + Motion + EMG-from-LFP](#step-8--lfp--motion--emg-from-lfp)
    - [Step d — DeepLabCut Export + Inference](#step-d--deeplabcut-export--inference)
    - [Step 9 — Cleanup](#step-9--cleanup)
+   - [Step f — Fix .txt Unix Timestamps](#step-f--fix-txt-unix-timestamps)
    - [Step n — Node Analysis](#step-n--node-analysis)
    - [Step w — NWB Packaging](#step-w--nwb-packaging)
    - [Step u — Add Curated Units to NWB](#step-u--add-curated-units-to-nwb)
@@ -210,7 +211,7 @@ data_root/
 ```
 
 - **Parallel steps** (`1 e 2 3 4 5 8 d n`) process each `ipN → opN` pair in its own worker.
-- **Sequential steps** (`7 c r 9 w u v b m t`) run at master level after all workers finish — steps `7 c r 9 u v b m` loop one folder at a time; steps `w` and `t` run **once over the whole root**. Steps c/r/u/v/b/m also accept **session-date folders** (`YYYYMMDD/` whose name appears in a file inside them) as targets — the layout used on the processed network share.
+- **Sequential steps** (`7 c r 9 f w u v b m t`) run at master level after all workers finish — steps `7 c r 9 f u v b m` loop one folder at a time; steps `w` and `t` run **once over the whole root**. Steps c/r/u/v/b/m also accept **session-date folders** (`YYYYMMDD/` whose name appears in a file inside them) as targets — the layout used on the processed network share.
 - **Step 6** (compression) is always pulled out and runs **last**, over every top-level `.mp4` of every `op*` folder.
 
 ---
@@ -265,6 +266,7 @@ The interactive menu:
 [8] LFP + Motion (IMU Accel) + EMG-from-LFP
 [d] deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)
 [9] Cleaning
+[f] Fix .txt unix timestamps (repair re-tracked sessions; framewise ts<->seconds mapping)
 [n] Node Analysis
 [w] nwblfp (NWB / LFP package)
 [u] Add curated Units (metrics + waveforms) to NWB (runs after w)
@@ -274,7 +276,7 @@ The interactive menu:
 [t] Drive scan (videos playable + ephys has pre/task/post + non-zero .rec)
 ```
 
-Type any combination (order irrelevant — execution order is fixed: parallel workers `1→e→2→3→4→5→8→d→n`, then sequential `7→c→r→9→w→u→v→b→m→t`, then `6` last). A stray `s` is ignored with a notice — the cross-session summary moved to the HM_Rat_Analysis repo.
+Type any combination (order irrelevant — execution order is fixed: parallel workers `1→e→2→3→4→5→8→d→n`, then sequential `7→c→r→9→f→w→u→v→b→m→t`, then `6` last). A stray `s` is ignored with a notice — the cross-session summary moved to the HM_Rat_Analysis repo.
 
 Each parallel worker opens its **own terminal window** by default (`runner.py --worker <ip> <op> <steps> <marker>`); the master polls a `<tmp>/hm_worker_<name>.done` marker. Set `WORKER_WINDOWS=0` to run workers as background threads logging to `<tmp>/hm_worker_<name>.log`. Workers are launched `LAUNCH_GAP` (20 s) apart.
 
@@ -402,7 +404,7 @@ Encoding is delegated to **`src/tools/vcodec.py`**: it probes *real encodes at t
 python src/tracker/TrackerYolov11.py --input_folder <ip> --output_folder <op> --onnx_weight <weights.pt>
 ```
 
-Runs the full detect → classify → trial-state-machine loop on the stitched video (details in [Tracker — How It Works](#tracker--how-it-works)). Every frame is processed at `DISPLAY_SIZE` **1176×712** — all pixel coordinates in CSVs, logs and the maze ROI live in this frame. Fixed inputs resolved from the repo root (the runner chdirs there): node map `src/tools/node_list_new.csv` and maze polygon `src/tools/maze_roi.txt` (restricts *rat* detections only; the run refuses to start on a resolution mismatch — redraw with `src/tools/define_maze_roi.py`). Sync CSVs are read from **op** (priority: `<date>_Rat<N>_framewise_ts.csv` → `stitched_framewise_seconds.csv` → `stitched_framewise_ts.csv`).
+Runs the full detect → classify → trial-state-machine loop on the stitched video (details in [Tracker — How It Works](#tracker--how-it-works)). Every frame is processed at `DISPLAY_SIZE` **1176×712** — all pixel coordinates in CSVs, logs and the maze ROI live in this frame. Fixed inputs resolved from the repo root (the runner chdirs there): node map `src/tools/node_list_new.csv` and maze polygon `src/tools/maze_roi.txt` (restricts *rat* detections only; the run refuses to start on a resolution mismatch — redraw with `src/tools/define_maze_roi.py`). Sync CSVs are read from **op**, seconds files first (priority: `stitched_framewise_seconds.csv` → `<date>_Rat<N>_framewise_seconds.csv` → `stitched_framewise_ts.csv` → `<date>_Rat<N>_framewise_ts.csv`) — the unix-clock `_ts` files are a last resort only, so re-runs keep the `.txt` on session seconds.
 
 **Outputs (op):**
 
@@ -413,7 +415,7 @@ Runs the full detect → classify → trial-state-machine loop on the stitched v
 | `<date>_Rat<N>.txt` | Per-trial node sequences, segment timing, velocities |
 | `log_<date>_Rat<N>.log` | Run log (overwritten each run by design) |
 | `RecordingMeta.xlsx` (copy) | Original + appended per-trial columns (see [RecordingMeta output columns](#recordingmeta-output-columns)) |
-| `<date>_Rat<N>_framewise_ts.csv` | The sync CSV renamed at the end of the run |
+| `<date>_Rat<N>_framewise_seconds.csv` / `..._framewise_ts.csv` | Both sync CSVs, session-prefixed at the end of the run |
 
 > Not headless: a live cv2 preview window opens; pressing `q` aborts the run.
 
@@ -516,6 +518,12 @@ Part 2 runs **only if `DLC_CONFIG_PATH` points to an existing DLC `config.yaml`*
 ### Step 9 — Cleanup
 
 Inline in `runner.py` (`clean_folder`): deletes top-level directories in each **ip** folder matching `*.DIO`, `*.raw`, `*timestampoffset*`. The `.rec` files are never touched. Irreversible; errors silently ignored — run only after steps 2/7 are verified.
+
+### Step f — Fix .txt Unix Timestamps
+
+**Script:** `src/tracker/fix_txt_timestamps.py --output_folder <op> [--dry_run]`
+
+Remediation for sessions re-tracked before the sync-CSV rename fix: their `<date>_Rat<N>.txt` carries unix timestamps (~1.7e9 s) instead of session seconds. The two sync CSVs are frame-aligned, so unix → seconds is an exact per-frame mapping: the step builds it from `*framewise_ts.csv` ↔ `*framewise_seconds.csv` and rewrites the `.txt` in place (original kept once as `<name>.txt.unixbak`). Only numeric values > 1e6 in the two timestamp positions (`Trial End (Sync Seconds):` and each transition's `(t_start, t_end)`) are converted — healthy files are left byte-identical, so the step is idempotent; `N/A` and durations are untouched. Re-run `w → u` afterwards if the session's NWB `Trials_Data` should pick up the corrected values.
 
 ### Step n — Node Analysis
 
@@ -640,7 +648,7 @@ Menu bar: **Fix / Prepare** — *Organize into folder…* (consolidate everythin
 
 These conventions hold across steps 5/w/u/v/b/m — worth internalising before touching the analysis code:
 
-- **The master session clock** is `stitched_framewise_seconds.csv` → *Seconds From Creation*. NWB positions, spike times and trial windows (`Trial_start_s/Trial_end_s`, `build_trials`) all live on it; the LFP maze recording starts at its zero. The tracker's `trial_start_time`/`trial_end_time` (RecordingMeta copy) are on a *different*, drifting behavioural-sync clock — never mix them with positions.
+- **The master session clock** is `stitched_framewise_seconds.csv` → *Seconds From Creation* (renamed to `<date>_Rat<N>_framewise_seconds.csv` when a tracker run finishes; consumers match both). NWB positions, spike times and trial windows (`Trial_start_s/Trial_end_s`, `build_trials`) all live on it; the LFP maze recording starts at its zero. The tracker's `trial_start_time`/`trial_end_time` (RecordingMeta copy) are on a *different*, drifting behavioural-sync clock — never mix them with positions.
 - **Pixel frame:** everything the tracker writes is in the 1176×712 display frame. **Metre frame:** analyses divide by `SCALE_X = 2352/2/9 ≈ 130.7 px/m`, `SCALE_Y = 1424/2/5 = 142.4 px/m` into a fixed maze box `MAZE_EXTENT = (0–9, 0–5) m`; the y axis is inverted (camera y grows downward). The canonical node map is `src/tools/node_list_new.csv` (98 nodes, 4 islands + homeboxes).
 - **Speed gating:** all place-cell analyses — rate maps, spatial information, decoder tuning curves *and* evaluated bins, spike videos, precession passes — use the same run-epoch gate, **0.05 m/s**.
 - **Splits:** event/theta/gamma/precession analyses report three columns: *goal running* (type-1 trials), *free roaming* (type-4/5), *all*.
@@ -766,7 +774,7 @@ A copy of `RecordingMeta.xlsx` is written to the output folder with these per-tr
 | `avg_between_node_speed` | Mean of per-segment speeds (m/s) |
 | `trial_start_time` / `trial_end_time` | Sync timestamps (s) — behavioural-sync clock, **not** comparable with NWB position timestamps |
 
-Framewise timestamp CSV priority: `<date>_Rat<id>_framewise_ts.csv` → `stitched_framewise_seconds.csv` → `stitched_framewise_ts.csv`.
+Framewise timestamp CSV priority: `stitched_framewise_seconds.csv` → `<date>_Rat<id>_framewise_seconds.csv` → `stitched_framewise_ts.csv` → `<date>_Rat<id>_framewise_ts.csv` (seconds clock preferred; both files are session-prefixed at the end of each run).
 
 ### Tracker — Modifications from Original
 

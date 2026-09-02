@@ -65,6 +65,7 @@ MENU = [
     ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP"),
     ("d", "deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)"),
     ("9", "Cleaning"),
+    ("f", "Fix .txt unix timestamps (repair re-tracked sessions; framewise ts<->seconds mapping)"),
     ("n", "Node Analysis"),
     ("w", "nwblfp (NWB / LFP package)"),
     ("u", "Add curated Units (metrics + waveforms) to NWB (runs after w)"),
@@ -76,7 +77,7 @@ MENU = [
 
 # Sequential master-level steps, in execution order. Everything NOT in here is
 # a parallel worker step.
-SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u", "v", "b", "m", "t"]
+SEQUENTIAL_STEPS = ["7", "c", "r", "9", "f", "w", "u", "v", "b", "m", "t"]
 
 
 # ------------------------------------------------------------
@@ -682,6 +683,10 @@ def main():
             print(f"\n[CLEAN {i}/{len(ops)}] Cleaning: {ip}")
             clean_folder(ip)
         print(f"\n[MASTER] Cleaning complete for all {len(ops)} folder(s).")
+
+    if has["f"]:
+        _run_per_op("FIX-TXT-TIMESTAMPS (unix -> seconds)", "FIXTXT",
+                    "./src/tracker/fix_txt_timestamps.py", seq_ops, config)
 
     if has["w"]:
         rat_nr = os.environ.get("NWB_RAT_NR", "1")

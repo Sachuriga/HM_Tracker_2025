@@ -110,7 +110,8 @@ def build_df_from_coords(work_dir, input_dir):
     # exact clock the decoder's saved track and step v use, so per-trial windows
     # and the decoded overlay stay aligned with no unix conversion anywhere.
     secs = pd.Series([np.nan] * len(cf))
-    st = _first("*stitched_framewise_seconds.csv")
+    # tracker renames stitched_framewise_seconds.csv -> <date>_Rat<N>_framewise_seconds.csv
+    st = _first("*framewise_seconds.csv")
     if st is not None and "Frame_Index" in cf.columns:
         sdf = pd.read_csv(st)
         fcol = next((c for c in sdf.columns if "frame" in c.lower()), None)

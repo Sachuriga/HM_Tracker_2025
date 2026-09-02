@@ -12,6 +12,7 @@ def normalize_key(path: Path) -> str:
       20200914_Rat1_Coordinates_Full.csv -> coordinates_full
       20200914_Rat1_framewise_ts.csv     -> framewise_ts
       stitched_framewise_seconds.csv     -> stitched_framewise_seconds
+      20200914_Rat1_framewise_seconds.csv -> framewise_seconds  (tracker-renamed)
     """
     # returns final file name (excl. .ext)
     stem = path.stem

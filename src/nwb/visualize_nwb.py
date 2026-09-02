@@ -301,10 +301,12 @@ def read_trials_raw(op_folder):
 
 
 def frame_to_seconds(op_folder):
-    """{frame_number: seconds} from stitched_framewise_seconds.csv
-    ('Seconds From Creation'), which IS the clock the NWB position/spike
-    timestamps use. None if unavailable."""
-    st = _pick_file(op_folder, "*stitched_framewise_seconds.csv")
+    """{frame_number: seconds} from the framewise-seconds CSV ('Seconds From
+    Creation'), which IS the clock the NWB position/spike timestamps use.
+    The tracker renames stitched_framewise_seconds.csv to
+    <date>_Rat<N>_framewise_seconds.csv at the end of a run, so match both.
+    None if unavailable."""
+    st = _pick_file(op_folder, "*framewise_seconds.csv")
     if st is None:
         return None
     try:

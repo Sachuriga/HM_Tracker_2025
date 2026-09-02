@@ -132,7 +132,7 @@ def _load_frame_arrays(op):
             if 0 <= f < n:
                 sec[f] = s
     if not np.isfinite(sec).any():
-        print("  no frame->seconds map (stitched_framewise_seconds.csv) — aborting.")
+        print("  no frame->seconds map (*framewise_seconds.csv) — aborting.")
         return None
     return sec, x, y, trial, n
 

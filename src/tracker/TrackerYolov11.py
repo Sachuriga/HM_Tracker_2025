@@ -197,27 +197,29 @@ class Tracker:
 
         self.ts_file_loaded = False
         try:
-            specific_ts_path = os.path.join(out, f'{str(self.date)}_Rat{str(self.rat)}_framewise_ts.csv')
-            if os.path.exists(specific_ts_path):
-                 self.sync_ts_dict = pd.read_csv(specific_ts_path, index_col=0).to_dict()
-                 print("Loaded timestamp file: " + os.path.basename(specific_ts_path))
-                 self.ts_file_loaded = True
-            else:
-                 candidates = [
-                     'stitched_framewise_seconds.csv',
-                     'stitched_framewise_ts.csv',
-                 ]
-                 loaded = False
-                 for fname in candidates:
-                     p = os.path.join(out, fname)
-                     if os.path.exists(p):
-                         print(f"Specific timestamp file not found. Loading '{fname}'...")
-                         self.sync_ts_dict = pd.read_csv(p, index_col=0).to_dict()
-                         self.ts_file_loaded = True
-                         loaded = True
-                         break
-                 if not loaded:
-                     raise FileNotFoundError
+            # SECONDS files first ('Seconds From Creation', the session clock the
+            # NWB/analyses use). Fresh unprefixed (a re-run of the sync step) beats
+            # the prefixed copy this tracker renamed on a previous run. The unix
+            # 'Corrected Time Stamp' files are a LAST resort only — an earlier
+            # version preferred the renamed _ts file, which silently switched the
+            # .txt timestamps to unix time on every re-run.
+            candidates = [
+                'stitched_framewise_seconds.csv',
+                f'{str(self.date)}_Rat{str(self.rat)}_framewise_seconds.csv',
+                'stitched_framewise_ts.csv',
+                f'{str(self.date)}_Rat{str(self.rat)}_framewise_ts.csv',
+            ]
+            loaded = False
+            for fname in candidates:
+                p = os.path.join(out, fname)
+                if os.path.exists(p):
+                    print(f"Loading timestamp file: '{fname}'...")
+                    self.sync_ts_dict = pd.read_csv(p, index_col=0).to_dict()
+                    self.ts_file_loaded = True
+                    loaded = True
+                    break
+            if not loaded:
+                raise FileNotFoundError
         except Exception:
              print("Warning: No timestamp CSV found. Logs might lack sync times.")
              self.sync_ts_dict = {"Corrected Time Stamp": {}} 
@@ -235,19 +237,25 @@ class Tracker:
         self.run_vid()
     
     def change_name_csv(self, output_path):
-        csvfile_name = os.path.join(output_path,f'{str(self.date)}_Rat{str(self.rat)}_framewise_ts.csv')
-        stitched_name = os.path.join(output_path,'stitched_framewise_ts.csv')
-        
-        if os.path.exists(stitched_name):
-            try:
-                if os.path.exists(csvfile_name):
-                    os.remove(csvfile_name)
-                os.rename(stitched_name, csvfile_name)
-                print(f"File renamed to: {os.path.basename(csvfile_name)}")
-            except OSError as e:
-                print(f"Error renaming file: {e}")
-        else:
-            pass
+        # Session-prefix BOTH sync CSVs at the end of a run. Renaming only the
+        # unix _ts file (as before) made re-runs load it with top priority and
+        # flip the .txt timestamps to unix time; the loader now prefers the
+        # seconds files, and both get the same <date>_Rat<N>_ prefix here.
+        pfx = f'{str(self.date)}_Rat{str(self.rat)}_'
+        for src_name, dst_name in (
+            ('stitched_framewise_seconds.csv', f'{pfx}framewise_seconds.csv'),
+            ('stitched_framewise_ts.csv',      f'{pfx}framewise_ts.csv'),
+        ):
+            src = os.path.join(output_path, src_name)
+            dst = os.path.join(output_path, dst_name)
+            if os.path.exists(src):
+                try:
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                    os.rename(src, dst)
+                    print(f"File renamed to: {dst_name}")
+                except OSError as e:
+                    print(f"Error renaming file: {e}")
         
     def load_network(self, model_path):
         import torch

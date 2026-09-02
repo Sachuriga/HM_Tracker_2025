@@ -681,7 +681,7 @@ if __name__ == "__main__":
         df_coordinates_with_frames = safe_read('Coordinates_Full_with_frames', paths.csv_paths, 'csv')
         # Try to load framewise files; if they don't exist, they'll be None
         df_framewise_ts = safe_read('framewise_ts', paths.csv_paths, 'csv')
-        df_framewise_seconds = safe_read('stitched_framewise_seconds', paths.csv_paths, 'csv')
+        df_framewise_seconds = safe_read('framewise_seconds', paths.csv_paths, 'csv')
         df_log = safe_read(next(iter(paths.log_paths)), paths.log_paths, 'log') if paths.log_paths else None
         df_txt = safe_read(next(iter(paths.txt_paths)), paths.txt_paths, 'txt') if paths.txt_paths else None
 
